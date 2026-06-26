@@ -1,0 +1,13 @@
+{
+  "version": "2.1.2",
+  "date": "2026-06-26",
+  "changelog": [
+    {
+      "version": "2.1.2",
+      "date": "2026-06-25",
+      "notes": [
+        "Prima versione distribuita ufficialmente: licenza GPLv3, repository pubblico su GitHub, pacchetti scaricabili da chiunque tramite GitHub Releases."
+      ]
+    }
+  ]
+}
