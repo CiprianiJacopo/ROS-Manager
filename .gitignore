@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# ROSM runtime data, keys and secrets
+.first_run_done
+.rosm_key
+.rosm_recovery
+app_log.json
+backup_config.json
+backups/
+config.json
+devices.json
+ping_history.json
+state.json
+users.json
+uploads/
