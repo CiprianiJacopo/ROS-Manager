@@ -16,6 +16,7 @@ A single-file Python server for centrally managing fleets of MikroTik routers �
 - **RouterOS updates** — check and push RouterOS updates to your routers over SSH
 - **Multi-user** — admin/viewer roles, optional 2FA (TOTP)
 - **Encrypted storage** — credentials and backups encrypted at rest
+- **Password and SSH key credentials** — reusable credential sets can authenticate with a password or an SSH private key (Ed25519, ECDSA or RSA, optional passphrase)
 - **Self-updating** — checks GitHub for new releases and updates itself with one click
 
 ## Install

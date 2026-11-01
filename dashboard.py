@@ -59,6 +59,7 @@ import urllib.parse
 import paramiko
 import cgi
 import io as _io
+from html import escape as _esc
 from http.server import ThreadingHTTPServer
 try:
     import pyotp, segno
@@ -771,6 +772,18 @@ _T_EN: dict = {
     "Backup Manager": "Backup Manager",
     "Site Manager": "Site Manager",
     "Credential Manager": "Credential Manager",
+    "Chiave SSH": "SSH key",
+    "Chiave privata": "Private key",
+    "Chiave pubblica": "Public key",
+    "Impronta chiave": "Key fingerprint",
+    "Passphrase (opzionale)": "Passphrase (optional)",
+    "Incolla o carica una chiave privata.": "Paste or upload a private key.",
+    "File troppo grande per una chiave privata.": "File is too large to be a private key.",
+    "La chiave privata non viene mai mostrata.": "The private key is never displayed.",
+    "Importa la chiave pubblica sul router: /user ssh-keys import public-key-file=... user=...":
+        "Import the public key on the router: /user ssh-keys import public-key-file=... user=...",
+    "Una chiave senza passphrase e protetta solo dalla cifratura di questa applicazione.":
+        "A key without a passphrase is protected only by this application's encryption.",
 }
 
 def T(s: str) -> str:
@@ -1002,29 +1015,29 @@ def device_remove(ip):
             return True
         return False
 
-def _get_device_creds(ip):
-    """Return (ssh_user, ssh_password) for a device.
+def _get_device_credential(ip) -> dict:
+    """Return the credential object for a device.
     Priority: named credential_id → per-device ssh_user/pass → site credential."""
     dev = DEVICES.get(ip, {})
     # 1. Named credential set assigned to device
     cred_id = dev.get("credential_id", "")
     if cred_id:
-        user, passwd = _resolve_cred_id(cred_id)
-        if user:
-            return user, passwd
-    # 2. Legacy per-device credentials
+        cred = _resolve_credential(cred_id)
+        if cred["username"]:
+            return cred
+    # 2. Legacy per-device credentials (password only)
     user   = dev.get("ssh_user", "") or ""
     enc    = dev.get("ssh_pass_enc", "") or ""
     passwd = _decrypt(enc) if enc else ""
     if user and passwd:
-        return user, passwd
+        return _make_credential(user, passwd)
     # 3. Site credential set
     site_id = dev.get("site_id", "")
     if site_id:
-        user, passwd = _get_creds_for_site(site_id)
-        if user:
-            return user, passwd
-    return "", ""
+        cred = _get_credential_for_site(site_id)
+        if cred["username"]:
+            return cred
+    return _make_credential()
 
 def _device_has_creds(ip):
     """True if the device has credentials configured (named set or per-device)."""
@@ -1169,7 +1182,7 @@ def _get_mac_from_arp(ip: str) -> str:
     """Read the MAC address for an IP from the OS ARP cache."""
     # macOS: subprocess.check_output() forks the multi-threaded server process,
     # which can crash (see _tcp_reachable). Skip there; RouterOS devices still
-    # get their MAC via SSH (_ssh_connect_creds) when credentials are set.
+    # get their MAC via SSH (_ssh_connect_cred) when credentials are set.
     if sys.platform != "darwin":
         try:
             arp_flag = "-a" if _IS_WINDOWS else "-n"
@@ -1235,7 +1248,7 @@ def _tcp_reachable(ip: str, timeout: float = 2.0) -> bool:
             pass
     return False
 
-def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
+def fingerprint_host(ip, cred=None, timeout=1.5):
     """Fingerprint a host: ping → ports → SSH banner → HTTP → reverse DNS."""
     result = {
         "ip": ip, "responding": False,
@@ -1311,9 +1324,9 @@ def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
             pass
 
         # If RouterOS and credentials provided → fetch identity/model/mac
-        if result["device_type"] == "routeros" and ssh_user and ssh_pass:
+        if result["device_type"] == "routeros" and _cred_usable(cred):
             try:
-                ssh = _ssh_connect_creds(ip, ssh_user, ssh_pass)
+                ssh = _ssh_connect_cred(ip, cred)
                 identity = _exec(ssh, ":put [/system identity get name]")
                 model    = (_exec(ssh, ":put [/system routerboard get model]")
                             or _exec(ssh, ":put [/system resource get board-name]"))
@@ -1327,11 +1340,11 @@ def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
                 pass
 
         # Generic SSH: try to get hostname for non-RouterOS devices
-        if result["device_type"] != "routeros" and ssh_user and ssh_pass:
+        if result["device_type"] != "routeros" and _cred_usable(cred):
             for cmd in ["hostname -s", "hostname", "cat /etc/hostname",
                         "uname -n", "sysctl kern.hostname | awk '{print $2}'"]:
                 try:
-                    ssh = _ssh_connect_creds(ip, ssh_user, ssh_pass)
+                    ssh = _ssh_connect_cred(ip, cred)
                     out = _exec(ssh, cmd)
                     ssh.close()
                     if out and len(out.strip()) > 0 and "\n" not in out.strip():
@@ -1435,14 +1448,13 @@ def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
 
     return result
 
-def start_scan_job(subnet_str, ssh_user, ssh_pass_enc, group_name):
+def start_scan_job(subnet_str, cred, group_name):
     try:
         net   = ipaddress.ip_network(subnet_str, strict=False)
         hosts = list(net.hosts())
     except ValueError:
         return None, "Subnet non valida"
 
-    ssh_pass = _decrypt(ssh_pass_enc) if ssh_pass_enc else ""
     job_id   = str(uuid.uuid4())
     total    = len(hosts)
 
@@ -1467,7 +1479,7 @@ def start_scan_job(subnet_str, ssh_user, ssh_pass_enc, group_name):
             SCAN_JOBS[job_id]["status"] = "done"
 
     def _scan_one(ip_str):
-        r = fingerprint_host(ip_str, ssh_user, ssh_pass)
+        r = fingerprint_host(ip_str, cred)
         with SCAN_JOBS_LOCK:
             SCAN_JOBS[job_id]["results"].append(r)
             SCAN_JOBS[job_id]["done"] += 1
@@ -2005,31 +2017,35 @@ def _ssh_err_str(exc: Exception) -> str:
     # Fallback
     return f"{name}: {msg[:120]}"
 
-def _ssh_connect(ip):
-    """Connect for READ — uses per-device credentials."""
-    user, passwd = _get_device_creds(ip)
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(ip, username=user, password=passwd, timeout=SSH_TIMEOUT,
-                look_for_keys=False, allow_agent=False,
-                banner_timeout=SSH_TIMEOUT + 2, auth_timeout=SSH_TIMEOUT + 2)
-    return ssh
+def _ssh_auth_kwargs(cred: dict) -> dict:
+    """Map a credential object to the paramiko connect() auth arguments.
+    New credential types (key, certificate) add a branch here."""
+    ctype = cred.get("type", CRED_TYPE_PASSWORD)
+    if ctype == CRED_TYPE_PASSWORD:
+        return {"username": cred.get("username", ""), "password": cred.get("password", "")}
+    if ctype == CRED_TYPE_SSH_KEY:
+        pkey = _load_private_key(cred.get("private_key", ""), cred.get("passphrase", ""))
+        return {"username": cred.get("username", ""), "pkey": pkey}
+    raise ValueError(f"Unsupported credential type: {ctype}")
 
-def _ssh_connect_creds(ip, username, password):
-    """Connect with explicit credentials — used for WRITE operations (upload/run)."""
+def _ssh_connect_cred(ip, cred: dict):
+    """Connect using a credential object (the single place that builds SSH connections)."""
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(
         ip,
-        username=username,
-        password=password,
         timeout=SSH_TIMEOUT,
         look_for_keys=False,
         allow_agent=False,
         banner_timeout=SSH_TIMEOUT + 2,
         auth_timeout=SSH_TIMEOUT + 2,
+        **_ssh_auth_kwargs(cred),
     )
     return ssh
+
+def _ssh_connect(ip):
+    """Connect for READ — uses per-device credentials."""
+    return _ssh_connect_cred(ip, _get_device_credential(ip))
 
 def _read_ssh_channel(channel, timeout: float = 20.0) -> str:
     """Read from a Paramiko channel with a hard wall-clock deadline.
@@ -2231,29 +2247,109 @@ def _migrate_cred_sets_encrypt():
 
 _migrate_cred_sets_encrypt()
 
-def cred_set_add(name, username, password):
+CRED_TYPE_PASSWORD = "password"
+CRED_TYPE_SSH_KEY = "ssh_key"
+CRED_TYPES = (CRED_TYPE_PASSWORD, CRED_TYPE_SSH_KEY)
+MAX_PRIVATE_KEY_BYTES = 16 * 1024
+
+def _load_private_key(key_text: str, passphrase: str = ""):
+    """Parse an OpenSSH/PEM private key (Ed25519, ECDSA or RSA) into a paramiko key.
+    Raises ValueError with a user-presentable message."""
+    key_text = (key_text or "").replace("\r\n", "\n").strip()
+    if not key_text:
+        raise ValueError("Private key is empty")
+    if len(key_text.encode()) > MAX_PRIVATE_KEY_BYTES:
+        raise ValueError("Private key is too large")
+    if "PRIVATE KEY" not in key_text:
+        raise ValueError("Not a private key (expected a PEM/OpenSSH private key)")
+    key_text += "\n"
+    for cls in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
+        try:
+            return cls.from_private_key(_io.StringIO(key_text), password=passphrase or None)
+        except paramiko.PasswordRequiredException:
+            raise ValueError("The key is passphrase-protected: a passphrase is required")
+        except (paramiko.SSHException, ValueError):
+            continue
+    raise ValueError("Invalid or unsupported private key, or wrong passphrase")
+
+def _key_fingerprint(pkey) -> str:
+    """OpenSSH-style SHA256 fingerprint, e.g. SHA256:abc..."""
+    digest = hashlib.sha256(pkey.asbytes()).digest()
+    return "SHA256:" + _b64.b64encode(digest).decode().rstrip("=")
+
+def _key_public_line(pkey) -> str:
+    """Public key in authorized_keys / RouterOS import format."""
+    return f"{pkey.get_name()} {pkey.get_base64()}"
+
+def _apply_ssh_key(entry: dict, private_key: str, passphrase: str) -> None:
+    """Validate a key and store its encrypted form and display metadata on a set."""
+    pkey = _load_private_key(private_key, passphrase)
+    entry["type"]            = CRED_TYPE_SSH_KEY
+    entry["private_key_enc"] = _encrypt(private_key.replace("\r\n", "\n").strip() + "\n")
+    entry["passphrase_enc"]  = _encrypt(passphrase) if passphrase else ""
+    entry["key_type"]        = pkey.get_name()
+    entry["fingerprint"]     = _key_fingerprint(pkey)
+    entry["public_key"]      = _key_public_line(pkey)
+    entry["password_enc"]    = ""
+
+def cred_set_add(name, username, password="", ctype=CRED_TYPE_PASSWORD,
+                 private_key="", passphrase=""):
+    """Add a credential set. Raises ValueError for an invalid type or key."""
+    if ctype not in CRED_TYPES:
+        raise ValueError(f"Unsupported credential type: {ctype}")
     cid = "cs_" + str(int(time.time() * 1000))
-    entry = {
-        "id": cid, "name": name,
-        "username_enc": _encrypt(username),
-        "password_enc": _encrypt(password),
-    }
+    entry = {"id": cid, "name": name, "username_enc": _encrypt(username)}
+    if ctype == CRED_TYPE_SSH_KEY:
+        _apply_ssh_key(entry, private_key, passphrase)
+    else:
+        entry["password_enc"] = _encrypt(password)
     with CRED_SETS_LOCK:
         CRED_SETS.append(entry)
         _save_cred_sets()
     return cid
 
-def cred_set_update(cid, name=None, username=None, password=None):
+def cred_set_update(cid, name=None, username=None, password=None,
+                    private_key=None, passphrase=None):
+    """Update a credential set. None means keep the existing value.
+    For key sets, a new private_key replaces the key (and passphrase); a new
+    passphrase alone re-validates against the stored key. Raises ValueError."""
     with CRED_SETS_LOCK:
-        for cs in CRED_SETS:
-            if cs["id"] == cid:
-                if name     is not None: cs["name"]         = name
-                if username is not None:
-                    cs["username_enc"] = _encrypt(username)
-                    cs.pop("username", None)   # remove old plaintext field if present
-                if password is not None: cs["password_enc"]  = _encrypt(password)
-                break
+        cs = next((c for c in CRED_SETS if c["id"] == cid), None)
+        if cs is None:
+            return
+        updated = dict(cs)
+        if name is not None: updated["name"] = name
+        if username is not None:
+            updated["username_enc"] = _encrypt(username)
+            updated.pop("username", None)   # remove old plaintext field if present
+        if updated.get("type", CRED_TYPE_PASSWORD) == CRED_TYPE_SSH_KEY:
+            if private_key is not None or passphrase is not None:
+                key_text = private_key if private_key is not None else _decrypt(updated.get("private_key_enc", ""))
+                if passphrase is not None:
+                    new_pass = passphrase
+                elif private_key is not None:
+                    new_pass = ""
+                else:
+                    new_pass = _decrypt(updated.get("passphrase_enc", ""))
+                _apply_ssh_key(updated, key_text, new_pass)
+        elif password is not None:
+            updated["password_enc"] = _encrypt(password)
+        cs.clear()
+        cs.update(updated)
         _save_cred_sets()
+
+def _cred_set_public(cs: dict) -> dict:
+    """Non-secret view of a credential set, safe to send to the browser."""
+    pub = {"id": cs["id"], "name": cs["name"], "type": cs.get("type", CRED_TYPE_PASSWORD)}
+    if pub["type"] == CRED_TYPE_SSH_KEY:
+        pub.update({k: cs.get(k, "") for k in ("key_type", "fingerprint", "public_key")})
+    return pub
+
+def _cred_label(cs: dict) -> str:
+    """Name shown in credential pickers; marks key sets so they are easy to tell apart."""
+    if cs.get("type", CRED_TYPE_PASSWORD) == CRED_TYPE_SSH_KEY:
+        return f'{cs["name"]} (SSH key)'
+    return cs["name"]
 
 def cred_set_remove(cid):
     with CRED_SETS_LOCK:
@@ -2272,25 +2368,43 @@ def _cred_set_username(cs: dict) -> str:
         return _decrypt(cs["username_enc"])
     return cs.get("username", "")   # legacy plaintext fallback
 
-def _resolve_cred_id(cred_id):
-    """Return (username, password) for a named credential set, or ('','') if not found."""
-    if not cred_id:
-        return "", ""
-    cs = next((c for c in CRED_SETS if c["id"] == cred_id), None)
-    if not cs:
-        return "", ""
-    return _cred_set_username(cs), _decrypt(cs.get("password_enc", ""))
+def _make_credential(username="", password="", ctype=CRED_TYPE_PASSWORD, **extra) -> dict:
+    """Build the in-memory credential object passed to connection code."""
+    cred = {"type": ctype, "username": username or "", "password": password or ""}
+    cred.update(extra)
+    return cred
 
-def _get_creds_for_site(site_id):
-    """Return (user, pass) from the credential set assigned to a site, or ('','')."""
-    site = SITES.get(site_id, {})
-    cid  = site.get("credential_id", "")
-    if not cid:
-        return "", ""
-    cs = next((c for c in CRED_SETS if c["id"] == cid), None)
-    if not cs:
-        return "", ""
-    return _cred_set_username(cs), _decrypt(cs.get("password_enc", ""))
+def _cred_usable(cred) -> bool:
+    """True if the credential object carries enough to attempt a login."""
+    if not cred or not cred.get("username"):
+        return False
+    ctype = cred.get("type", CRED_TYPE_PASSWORD)
+    if ctype == CRED_TYPE_PASSWORD:
+        return bool(cred.get("password"))
+    if ctype == CRED_TYPE_SSH_KEY:
+        return bool(cred.get("private_key"))
+    return False
+
+def _cred_set_to_credential(cs: dict) -> dict:
+    """Decrypt a stored credential set into a credential object. Sets without
+    a "type" are password sets."""
+    ctype = cs.get("type", CRED_TYPE_PASSWORD)
+    extra = {}
+    if ctype == CRED_TYPE_SSH_KEY:
+        extra = {"private_key": _decrypt(cs.get("private_key_enc", "")),
+                 "passphrase":  _decrypt(cs.get("passphrase_enc", ""))}
+    return _make_credential(_cred_set_username(cs), _decrypt(cs.get("password_enc", "")), ctype, **extra)
+
+def _resolve_credential(cred_id) -> dict:
+    """Return the credential object for a named set (empty password credential if not found)."""
+    cs = next((c for c in CRED_SETS if c["id"] == cred_id), None) if cred_id else None
+    return _cred_set_to_credential(cs) if cs else _make_credential()
+
+def _get_credential_for_site(site_id) -> dict:
+    """Return the credential object of the set assigned to a site (empty if none)."""
+    cid = SITES.get(site_id, {}).get("credential_id", "")
+    return _resolve_credential(cid)
+
 BACKUP_RUNNING  = False
 BACKUP_LOCK     = threading.Lock()
 BACKUP_LAST_RESULTS: list = []   # [{ip, name, file, size, ok, msg, ts}]
@@ -2305,20 +2419,20 @@ def _backup_filename(router_name, ip, show_sensitive=False):
     sens = "_S" if show_sensitive else ""
     return f"{safe}_{ts}{sens}.rsc"
 
-def backup_router(r, ssh_user=None, ssh_pass=None, show_sensitive=True, keep_on_router=False):
+def backup_router(r, cred=None, show_sensitive=True, keep_on_router=False):
     """SSH to one router, run /export [show-sensitive], save .rsc file.
-    Credential priority: explicit override (user+pass) → site credential set → per-router creds → global default."""
+    Credential priority: explicit override credential → site credential set → per-router creds → global default."""
     ip = r["ip"]
     try:
         # Resolve credentials: site lookup only when no complete override is provided
-        if not (ssh_user and ssh_pass):
+        if not _cred_usable(cred):
             site_id = r.get("site_id", "")
             if site_id:
-                u, p = _get_creds_for_site(site_id)
-                if u and p:
-                    ssh_user, ssh_pass = u, p
-        if ssh_user and ssh_pass:
-            ssh = _ssh_connect_creds(ip, ssh_user, ssh_pass)
+                site_cred = _get_credential_for_site(site_id)
+                if _cred_usable(site_cred):
+                    cred = site_cred
+        if _cred_usable(cred):
+            ssh = _ssh_connect_cred(ip, cred)
         else:
             ssh = _ssh_connect(ip)  # falls back to per-router or global default
         export_cmd = "/export show-sensitive" if show_sensitive else "/export"
@@ -2388,7 +2502,7 @@ def backup_apply_retention():
             pass
     return removed
 
-def backup_all(ips=None, ssh_user=None, ssh_pass=None, show_sensitive=None, keep_on_router=None):
+def backup_all(ips=None, cred=None, show_sensitive=None, keep_on_router=None):
     """Run backup on all ONLINE routers (or a subset by IP list)."""
     global BACKUP_RUNNING, BACKUP_LAST_RESULTS
     # Fall back to stored config values when not specified (automatic scheduler path)
@@ -2406,7 +2520,7 @@ def backup_all(ips=None, ssh_user=None, ssh_pass=None, show_sensitive=None, keep
         results    = []
         res_lock   = threading.Lock()
         def _do(r):
-            res = backup_router(r, ssh_user, ssh_pass, show_sensitive, keep_on_router)
+            res = backup_router(r, cred, show_sensitive, keep_on_router)
             with res_lock:
                 results.append(res)
         threads = [threading.Thread(target=_do, args=(r,), daemon=True) for r in targets]
@@ -2651,10 +2765,10 @@ def _update_router_script(ip, path, filename):
             return r["name"]
     return ""
 
-def sftp_push(ip, username, password, local_path):
-    """Push file to router /tmp/ via SFTP with provided credentials. Returns (ok, msg)."""
+def sftp_push(ip, cred, local_path):
+    """Push file to router /tmp/ via SFTP with the given credential. Returns (ok, msg)."""
     try:
-        ssh = _ssh_connect_creds(ip, username, password)
+        ssh = _ssh_connect_cred(ip, cred)
         remote = "/tmp/" + os.path.basename(local_path)
         sftp = ssh.open_sftp()
         sftp.put(local_path, remote)
@@ -2665,9 +2779,9 @@ def sftp_push(ip, username, password, local_path):
         return False, _ssh_err_str(e)
 
 def _bulk_job_worker(job_id, local_path, filename, targets):
-    """Background worker: push file to list of (ip, username, password) targets."""
-    for ip, username, password in targets:
-        ok, msg = sftp_push(ip, username, password, local_path)
+    """Background worker: push file to list of (ip, credential) targets."""
+    for ip, cred in targets:
+        ok, msg = sftp_push(ip, cred, local_path)
         name = _update_router_script(ip, local_path, filename) if ok else ""
         with JOBS_LOCK:
             JOBS[job_id]["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
@@ -2680,11 +2794,8 @@ def _upload_import_worker(job_id, local_path, filename, ips, run_after=True, cre
     for ip in ips:
         name = ""
         try:
-            if cred_id:
-                username, password = _resolve_cred_id(cred_id)
-            else:
-                username, password = _get_device_creds(ip)
-            ssh  = _ssh_connect_creds(ip, username, password)
+            cred = _resolve_credential(cred_id) if cred_id else _get_device_credential(ip)
+            ssh  = _ssh_connect_cred(ip, cred)
             sftp = ssh.open_sftp()
             sftp.put(local_path, remote)
             sftp.close()
@@ -4848,7 +4959,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/creds":
             # Return cred sets without passwords
-            safe = [{"id": c["id"], "name": c["name"]} for c in CRED_SETS]
+            safe = [{"id": c["id"], "name": _cred_label(c)} for c in CRED_SETS]
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.send_header("Cache-Control", "no-store")
@@ -5606,7 +5717,7 @@ class Handler(BaseHTTPRequestHandler):
                       "/api/sites/add", "/api/sites/update", "/api/sites/remove",
                       "/api/sites/assign_bulk", "/api/device/topology", "/api/device/link_type",
                       "/api/backup/run", "/api/backup/config", "/api/backup/delete",
-                      "/api/creds/add", "/api/creds/update", "/api/creds/remove",
+                      "/api/creds/add", "/api/creds/update", "/api/creds/remove", "/api/creds/reveal",
                       "/api/sites/set_creds"}
         if path in JSON_PATHS:
             raw  = self.rfile.read(length) if length > 0 else b""
@@ -5623,12 +5734,10 @@ class Handler(BaseHTTPRequestHandler):
                 ssh_pass   = params.get("ssh_pass", "")
                 cred_id    = params.get("cred_id", "")
                 group_name = params.get("group", "")
-                if cred_id:
-                    ssh_user, ssh_pass = _resolve_cred_id(cred_id)
+                cred = _resolve_credential(cred_id) if cred_id else _make_credential(ssh_user, ssh_pass)
                 if not subnet:
                     return self._json({"ok": False, "msg": "Subnet mancante"})
-                ssh_pass_enc = _encrypt(ssh_pass) if ssh_pass else ""
-                job_id, err = start_scan_job(subnet, ssh_user, ssh_pass_enc, group_name)
+                job_id, err = start_scan_job(subnet, cred, group_name)
                 if err:
                     return self._json({"ok": False, "msg": err})
                 with SCAN_JOBS_LOCK:
@@ -5640,9 +5749,9 @@ class Handler(BaseHTTPRequestHandler):
                 devices_in = params.get("devices", [])
                 # Top-level cred_id: resolve once and apply to all devices
                 top_cred_id = params.get("cred_id", "")
-                top_ssh_user, top_ssh_pass = ("", "")
-                if top_cred_id:
-                    top_ssh_user, top_ssh_pass = _resolve_cred_id(top_cred_id)
+                top_cred = _resolve_credential(top_cred_id) if top_cred_id else _make_credential()
+                top_ssh_user, top_ssh_pass = top_cred["username"], top_cred["password"]
+                top_is_key = top_cred["type"] != CRED_TYPE_PASSWORD
                 added = 0
                 for d in devices_in:
                     ip = d.get("ip", "")
@@ -5660,6 +5769,12 @@ class Handler(BaseHTTPRequestHandler):
                         mac       = d.get("mac", ""),
                     )
                     if not existed:
+                        if top_is_key:
+                            # key sets cannot be copied into the legacy password fields: link the set instead
+                            with DEVICES_LOCK:
+                                if ip in DEVICES:
+                                    DEVICES[ip]["credential_id"] = top_cred_id
+                            _save_devices()
                         if site_id_d and site_id_d in SITES:
                             with DEVICES_LOCK:
                                 if ip in DEVICES:
@@ -5886,20 +6001,16 @@ class Handler(BaseHTTPRequestHandler):
                 ips           = set(ips_param) if ips_param else None
                 cred_id_over  = _p("cred_id")
                 if cred_id_over:
-                    ssh_user_over, ssh_pass_over = _resolve_cred_id(cred_id_over)
-                    ssh_user_over = ssh_user_over or None
-                    ssh_pass_over = ssh_pass_over or None
+                    cred_over = _resolve_credential(cred_id_over)
                 else:
-                    ssh_user_over = _p("ssh_user") or None
-                    ssh_pass_over = _p("ssh_pass") or None
-                    if not (ssh_user_over and ssh_pass_over):
-                        ssh_user_over = None
-                        ssh_pass_over = None
+                    cred_over = _make_credential(_p("ssh_user"), _p("ssh_pass"))
+                if not _cred_usable(cred_over):
+                    cred_over = None
                 _bk_show_sens    = bool(params.get("show_sensitive", True))
                 _bk_keep_router  = bool(params.get("keep_on_router", False))
                 threading.Thread(
                     target=backup_all,
-                    args=(ips, ssh_user_over, ssh_pass_over, _bk_show_sens, _bk_keep_router),
+                    args=(ips, cred_over, _bk_show_sens, _bk_keep_router),
                     daemon=True
                 ).start()
                 return self._json({"ok": True})
@@ -5929,22 +6040,42 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
 
             # ── Credential sets CRUD ─────────────────────────────────────
+            def _raw(key):
+                # unstripped value (passphrases may legitimately contain spaces)
+                v = params.get(key, "")
+                v = v[0] if isinstance(v, list) and v else ("" if isinstance(v, list) else v)
+                return str(v)
+
             if path == "/api/creds/add":
                 cs_name  = _p("name")
                 username = _p("username")
+                ctype    = _p("type") or CRED_TYPE_PASSWORD
                 password = _p("password")
-                if not cs_name or not username or not password:
+                if not cs_name or not username:
                     return self._json({"ok": False, "msg": "nome, username e password richiesti"})
-                cid = cred_set_add(cs_name, username, password)
-                return self._json({"ok": True, "id": cid,
-                                   "cred": {"id": cid, "name": cs_name}})
+                if ctype == CRED_TYPE_PASSWORD and not password:
+                    return self._json({"ok": False, "msg": "nome, username e password richiesti"})
+                if ctype == CRED_TYPE_SSH_KEY and not _raw("private_key").strip():
+                    return self._json({"ok": False, "msg": "A private key is required"})
+                try:
+                    cid = cred_set_add(cs_name, username, password, ctype,
+                                       _raw("private_key"), _raw("passphrase"))
+                except ValueError as e:
+                    return self._json({"ok": False, "msg": str(e)})
+                cs = next(c for c in CRED_SETS if c["id"] == cid)
+                return self._json({"ok": True, "id": cid, "cred": _cred_set_public(cs)})
 
             if path == "/api/creds/update":
                 cid      = _p("id")
                 cs_name  = _p("name")  or None
                 username = _p("username") or None
                 password = _p("password") or None
-                cred_set_update(cid, name=cs_name, username=username, password=password)
+                try:
+                    cred_set_update(cid, name=cs_name, username=username, password=password,
+                                    private_key=_raw("private_key") or None,
+                                    passphrase=_raw("passphrase") or None)
+                except ValueError as e:
+                    return self._json({"ok": False, "msg": str(e)})
                 return self._json({"ok": True})
 
             if path == "/api/creds/remove":
@@ -5960,6 +6091,10 @@ class Handler(BaseHTTPRequestHandler):
                 cs = next((c for c in CRED_SETS if c["id"] == cid), None)
                 if not cs:
                     return self._json({"ok": False, "msg": "Set non trovato."})
+                if cs.get("type", CRED_TYPE_PASSWORD) == CRED_TYPE_SSH_KEY:
+                    # never reveal private key material, only identifying metadata
+                    return self._json({"ok": True, "username": _cred_set_username(cs), "password": "",
+                                       **_cred_set_public(cs)})
                 return self._json({
                     "ok":       True,
                     "username": _cred_set_username(cs),
@@ -6097,15 +6232,12 @@ class Handler(BaseHTTPRequestHandler):
             def _run_ros_check_job(jid, ip_list, _cred_id=cred_id_ck, _channel=channel_ck):
                 def _one(ip_):
                     name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
-                    if _cred_id:
-                        u, p = _resolve_cred_id(_cred_id)
-                    else:
-                        u, p = _get_device_creds(ip_)
-                    if not u:
+                    cred = _resolve_credential(_cred_id) if _cred_id else _get_device_credential(ip_)
+                    if not cred["username"]:
                         return {"ip": ip_, "name": name_, "ok": False,
                                 "msg": "Credenziali SSH non configurate"}
                     try:
-                        ssh = _ssh_connect_creds(ip_, u, p)
+                        ssh = _ssh_connect_cred(ip_, cred)
                         if _channel:
                             _, _co, _ = ssh.exec_command(
                                 f"/system package update set channel={_channel}")
@@ -6180,15 +6312,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "Nessun router selezionato"})
             def _ros_install_one(ip_, _cred_id=cred_id_in, _channel=channel_in):
                 name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
-                if _cred_id:
-                    u, p = _resolve_cred_id(_cred_id)
-                else:
-                    u, p = _get_device_creds(ip_)
-                if not u:
+                cred = _resolve_credential(_cred_id) if _cred_id else _get_device_credential(ip_)
+                if not cred["username"]:
                     return {"ip": ip_, "name": name_, "ok": False,
                             "msg": "Credenziali SSH non configurate"}
                 try:
-                    ssh = _ssh_connect_creds(ip_, u, p)
+                    ssh = _ssh_connect_cred(ip_, cred)
                     if _channel:
                         _, _ci, _ = ssh.exec_command(
                             f"/system package update set channel={_channel}")
@@ -6243,15 +6372,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "Nessun router selezionato"})
             def _ros_download_one(ip_, _channel=channel_dl):
                 name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
-                if cred_id_dl:
-                    u, p = _resolve_cred_id(cred_id_dl)
-                else:
-                    u, p = _get_device_creds(ip_)
-                if not u:
+                cred = _resolve_credential(cred_id_dl) if cred_id_dl else _get_device_credential(ip_)
+                if not cred["username"]:
                     return {"ip": ip_, "name": name_, "ok": False,
                             "msg": "Credenziali SSH non configurate"}
                 try:
-                    ssh = _ssh_connect_creds(ip_, u, p)
+                    ssh = _ssh_connect_cred(ip_, cred)
                     if _channel:
                         _, _cd, _ = ssh.exec_command(
                             f"/system package update set channel={_channel}")
@@ -6309,11 +6435,8 @@ class Handler(BaseHTTPRequestHandler):
             def _npk_worker(_cred=cred_id_npk):
                 for ip in ips:
                     try:
-                        if _cred:
-                            u_npk, p_npk = _resolve_cred_id(_cred)
-                        else:
-                            u_npk, p_npk = _get_device_creds(ip)
-                        ssh  = _ssh_connect_creds(ip, u_npk, p_npk)
+                        cred = _resolve_credential(_cred) if _cred else _get_device_credential(ip)
+                        ssh  = _ssh_connect_cred(ip, cred)
                         sftp = ssh.open_sftp()
                         sftp.put(local_path_npk, filename_npk)
                         sftp.close()
@@ -6357,19 +6480,18 @@ class Handler(BaseHTTPRequestHandler):
             cred_id_f = form.getvalue("cred_id", "")
             username  = form.getvalue("username", "")
             password  = form.getvalue("password", "")
-            if cred_id_f:
-                username, password = _resolve_cred_id(cred_id_f)
+            cred = _resolve_credential(cred_id_f) if cred_id_f else _make_credential(username, password)
             fileitem = form["file"] if "file" in form else None
 
             if not ip:
                 return self._json({"ok": False, "msg": "IP mancante"})
             if fileitem is None or not getattr(fileitem, "filename", ""):
                 return self._json({"ok": False, "msg": "Nessun file selezionato"})
-            if not username or not password:
+            if not _cred_usable(cred):
                 return self._json({"ok": False, "msg": "Credenziali mancanti"})
 
             filename, local_path = _save_upload(fileitem)
-            ok, msg = sftp_push(ip, username, password, local_path)
+            ok, msg = sftp_push(ip, cred, local_path)
             if ok:
                 name = _update_router_script(ip, local_path, filename)
                 return self._json({"ok": True, "msg": "Caricato su " + ip + " (" + (name or ip) + ")"})
@@ -6401,7 +6523,7 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 for r in ROUTERS:
                     if r["ip"].startswith(prefix):
-                        targets.append((r["ip"], username, password))
+                        targets.append((r["ip"], _make_credential(username, password)))
 
             if not targets:
                 return self._json({"ok": False, "msg": "Nessun router trovato per le aziende selezionate"})
@@ -9775,7 +9897,7 @@ html,body{{min-height:100%;margin:0;background:var(--bg);}}
         no_backup_js    = json.dumps(no_backup_ips)
         stale_backup_js = json.dumps(stale_ips)
         # Cred sets for the credential assignment UI (name only, no credentials)
-        cred_sets_js    = json.dumps([{"id": c["id"], "name": c["name"]} for c in CRED_SETS])
+        cred_sets_js    = json.dumps([{"id": c["id"], "name": _cred_label(c)} for c in CRED_SETS])
 
         # ── Server-side file list ──────────────────────────────────────
         bk_files = backup_list_files()
@@ -9908,7 +10030,7 @@ html,body{{min-height:100%;margin:0;background:var(--bg);}}
       </div>
       <select id="bkCredPicker" onchange="applyBkCred(this.value)" style="width:100%;box-sizing:border-box;font-size:12px;margin-bottom:4px;">
         <option value="">— Automatico: usa le credenziali del sito o del router —</option>
-        {chr(10).join(f'        <option value="{c["id"]}">{c["name"]}</option>' for c in CRED_SETS)}
+        {chr(10).join(f'        <option value="{c["id"]}">{_esc(_cred_label(c))}</option>' for c in CRED_SETS)}
       </select>
       {'<div style="margin-bottom:4px;font-size:10px;color:var(--text3);font-style:italic;">Nessun set credenziali configurato. <a href="/credentials" style="color:var(--accent);">Creane uno nel Credential Manager →</a></div>' if not CRED_SETS else ''}
       <div id="bkCredInfo" style="margin-bottom:16px;font-size:11px;min-height:14px;padding:6px 10px;border-radius:6px;background:var(--bg3);border:1px solid var(--border);display:none;"></div>
@@ -10486,12 +10608,20 @@ onTargetChange();
             # Show first 2 chars of username (decrypted server-side), rest hidden
             uname_full    = _cred_set_username(c)
             uname_preview = (uname_full[:2] + "••••") if len(uname_full) >= 2 else ("••••" if uname_full else "—")
+            if c.get("type", CRED_TYPE_PASSWORD) == CRED_TYPE_SSH_KEY:
+                secret_html = (
+                    f'<span style="color:var(--text3);margin-left:6px;font-size:10px;">/ {T("Chiave SSH")} '
+                    f'{_esc(c.get("key_type", ""))}</span>'
+                    f'<div style="font-size:10px;color:var(--text3);margin-top:2px;">{_esc(c.get("fingerprint", ""))}</div>'
+                )
+            else:
+                secret_html = '<span style="color:var(--text3);margin-left:6px;letter-spacing:1px;font-size:10px;">/ ••••••••</span>'
             cred_rows += (
                 f'<tr>'
-                f'<td style="font-weight:600;color:var(--text);">{c["name"]}</td>'
+                f'<td style="font-weight:600;color:var(--text);">{_esc(c["name"])}</td>'
                 f'<td style="font-family:var(--mono);font-size:12px;color:var(--text2);">'
                 f'{uname_preview}'
-                f'<span style="color:var(--text3);margin-left:6px;letter-spacing:1px;font-size:10px;">/ ••••••••</span>'
+                f'{secret_html}'
                 f'</td>'
                 f'<td style="font-size:11px;">{usage_txt}</td>'
                 f'<td style="white-space:nowrap;">'
@@ -10503,7 +10633,7 @@ onTargetChange();
                 f'</tr>'
             )
 
-        cred_sets_js = json.dumps([{"id": c["id"], "name": c["name"]} for c in CRED_SETS])
+        cred_sets_js = json.dumps([_cred_set_public(c) for c in CRED_SETS])
 
         # Build site-credential assignment rows (avoid nested triple-quoted f-strings for Python 3.9 compat)
         if not SITES:
@@ -10514,7 +10644,7 @@ onTargetChange();
                 opts = '<option value="">— Credenziali del singolo router —</option>'
                 for c in CRED_SETS:
                     sel = ' selected' if s.get("credential_id") == c["id"] else ''
-                    opts += f'<option value="{c["id"]}"{sel}>{c["name"]}</option>'
+                    opts += f'<option value="{c["id"]}"{sel}>{_esc(_cred_label(c))}</option>'
                 city_span = f' <span style="font-size:10px;color:var(--text3);font-weight:400;">({s.get("city","")})</span>' if s.get("city") else ""
                 site_creds_rows += (
                     f'<tr style="border-bottom:1px solid var(--border);">'
@@ -10592,37 +10722,80 @@ function openCredModal(cid) {{
   document.getElementById('credModalId').value = cid||'';
   var isEdit = !!cid;
   document.getElementById('credModalTitle').textContent = isEdit ? '{T("Modifica credenziali")}' : '{T("Nuove credenziali")}';
-  document.getElementById('credModalPassRow').style.display = '';
   document.getElementById('credModalPassHint').style.display = isEdit ? 'inline' : 'none';
-  if(isEdit) {{
-    var c = CRED_SETS_DATA.find(function(x){{return x.id===cid;}});
-    document.getElementById('credModalName').value = c ? c.name : '';
-    document.getElementById('credModalUser').value = '';   // username not sent to client for security
-    document.getElementById('credModalPass').value = '';
-  }} else {{
-    document.getElementById('credModalName').value = '';
-    document.getElementById('credModalUser').value = '';
-    document.getElementById('credModalPass').value = '';
-  }}
+  document.getElementById('credModalKeyHint').style.display = isEdit ? 'inline' : 'none';
+  var c = isEdit ? CRED_SETS_DATA.find(function(x){{return x.id===cid;}}) : null;
+  document.getElementById('credModalName').value = c ? c.name : '';
+  document.getElementById('credModalUser').value = '';   // username not sent to client for security
+  document.getElementById('credModalPass').value = '';
+  document.getElementById('credModalKey').value = '';
+  document.getElementById('credModalKeyFile').value = '';
+  document.getElementById('credModalPassphrase').value = '';
+  var t = document.getElementById('credModalType');
+  t.value = c ? (c.type || 'password') : 'password';
+  t.disabled = isEdit;   // type is fixed once created
+  credModalTypeChanged();
+  var info = document.getElementById('credModalKeyInfo');
+  if(c && c.type === 'ssh_key') {{
+    document.getElementById('credModalFp').textContent = c.fingerprint || '';
+    document.getElementById('credModalPub').value = (c.public_key || '');
+    info.style.display = '';
+  }} else info.style.display = 'none';
   document.getElementById('credModal').classList.add('modal-show');
   setTimeout(function(){{document.getElementById('credModalName').focus();}},80);
 }}
-function closeCredModal() {{ document.getElementById('credModal').classList.remove('modal-show'); }}
+function closeCredModal() {{
+  document.getElementById('credModal').classList.remove('modal-show');
+  document.getElementById('credModalKey').value = '';
+  document.getElementById('credModalPassphrase').value = '';
+}}
+function credModalTypeChanged() {{
+  var isKey = document.getElementById('credModalType').value === 'ssh_key';
+  document.getElementById('credModalPassRow').style.display = isKey ? 'none' : '';
+  document.getElementById('credModalKeyRows').style.display = isKey ? '' : 'none';
+}}
+function credModalLoadKeyFile(input) {{
+  var f = input.files && input.files[0];
+  if(!f) return;
+  if(f.size > 16384) {{ alert('{T("File troppo grande per una chiave privata.")}'); input.value=''; return; }}
+  var rd = new FileReader();
+  rd.onload = function(){{ document.getElementById('credModalKey').value = rd.result; }};
+  rd.readAsText(f);
+}}
+function copyCredPub() {{
+  var el = document.getElementById('credModalPub');
+  el.select();
+  navigator.clipboard.writeText(el.value);
+}}
+function copyRevealText(id) {{
+  navigator.clipboard.writeText(document.getElementById(id).textContent);
+}}
 
 async function saveCredModal() {{
   var cid      = document.getElementById('credModalId').value;
+  var ctype    = document.getElementById('credModalType').value;
   var name     = document.getElementById('credModalName').value.trim();
   var username = document.getElementById('credModalUser').value.trim();
   var password = document.getElementById('credModalPass').value;
+  var pkey     = document.getElementById('credModalKey').value;
+  var phrase   = document.getElementById('credModalPassphrase').value;
   if(!name)     {{ alert('{T("Inserisci un nome per questo set di credenziali.")}'); return; }}
   if(!username) {{ alert('{T("Inserisci lo username SSH.")}'); return; }}
-  if(!cid && !password) {{ alert('{T("Inserisci la password SSH.")}'); return; }}
   var body = {{name:name, username:username}};
-  if(password) body.password = password;
+  if(ctype === 'ssh_key') {{
+    if(!cid && !pkey.trim()) {{ alert('{T("Incolla o carica una chiave privata.")}'); return; }}
+    if(pkey.trim()) body.private_key = pkey;
+    if(phrase) body.passphrase = phrase;
+    if(!cid) body.type = 'ssh_key';
+  }} else {{
+    if(!cid && !password) {{ alert('{T("Inserisci la password SSH.")}'); return; }}
+    if(password) body.password = password;
+  }}
   if(cid) body.id = cid;
   var url = cid ? '/api/creds/update' : '/api/creds/add';
   var r = await fetch(url, {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
   var j = await r.json();
+  document.getElementById('credModalKey').value = '';
   if(j.ok) {{
     closeCredModal();
     window.location.reload();
@@ -10651,6 +10824,8 @@ function closeRevealModal() {{
   document.getElementById('revealModal').classList.remove('modal-show');
   document.getElementById('revealUser').textContent = '';
   document.getElementById('revealPass').textContent = '';
+  document.getElementById('revealFp').textContent = '';
+  document.getElementById('revealPub').textContent = '';
 }}
 async function doReveal() {{
   var cid  = document.getElementById('revealCredId').value;
@@ -10664,7 +10839,15 @@ async function doReveal() {{
   if(j.ok) {{
     errEl.style.display = 'none';
     document.getElementById('revealUser').textContent = j.username;
-    document.getElementById('revealPass').textContent = j.password;
+    var isKey = j.type === 'ssh_key';
+    document.getElementById('revealPassBox').style.display = isKey ? 'none' : '';
+    document.getElementById('revealKeyBox').style.display = isKey ? '' : 'none';
+    if(isKey) {{
+      document.getElementById('revealFp').textContent = j.fingerprint || '';
+      document.getElementById('revealPub').textContent = j.public_key || '';
+    }} else {{
+      document.getElementById('revealPass').textContent = j.password;
+    }}
     document.getElementById('revealInputArea').style.display = 'none';
     document.getElementById('revealResultArea').style.display = '';
   }} else {{
@@ -10693,6 +10876,14 @@ async function doReveal() {{
       <input type="text" id="credModalUser" placeholder="Username"
              style="width:100%;box-sizing:border-box;" autocomplete="off">
     </div>
+    <div style="margin-bottom:12px;">
+      <label style="font-size:10px;font-weight:700;color:var(--text2);display:block;
+             margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;">{T("Tipo")}</label>
+      <select id="credModalType" onchange="credModalTypeChanged()" style="width:100%;box-sizing:border-box;">
+        <option value="password">{T("Password")}</option>
+        <option value="ssh_key">{T("Chiave SSH")}</option>
+      </select>
+    </div>
     <div id="credModalPassRow" style="margin-bottom:20px;">
       <label style="font-size:10px;font-weight:700;color:var(--text2);display:block;
              margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;">
@@ -10702,6 +10893,35 @@ async function doReveal() {{
       </label>
       <input type="password" id="credModalPass" placeholder="{T('Password SSH')}"
              style="width:100%;box-sizing:border-box;" autocomplete="new-password">
+    </div>
+    <div id="credModalKeyRows" style="display:none;margin-bottom:20px;">
+      <div id="credModalKeyInfo" style="display:none;margin-bottom:12px;">
+        <label style="font-size:10px;font-weight:700;color:var(--text2);display:block;
+               margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;">{T("Impronta chiave")}</label>
+        <code id="credModalFp" style="display:block;font-size:11px;font-family:var(--mono);word-break:break-all;
+              background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:6px 8px;margin-bottom:8px;"></code>
+        <label style="font-size:10px;font-weight:700;color:var(--text2);display:block;
+               margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;">{T("Chiave pubblica")}</label>
+        <div style="display:flex;gap:6px;align-items:flex-start;">
+          <textarea id="credModalPub" readonly rows="3" style="flex:1;box-sizing:border-box;font-family:var(--mono);font-size:10px;"></textarea>
+          <button class="btn" style="padding:3px 8px;font-size:10px;" onclick="copyCredPub()">⎘</button>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:4px;">{T("Importa la chiave pubblica sul router: /user ssh-keys import public-key-file=... user=...")}</div>
+      </div>
+      <label style="font-size:10px;font-weight:700;color:var(--text2);display:block;
+             margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;">
+        {T("Chiave privata")} *
+        <span id="credModalKeyHint" style="font-weight:400;text-transform:none;
+              color:var(--text3);letter-spacing:0;">{T("(vuoto = non cambiare)")}</span>
+      </label>
+      <textarea id="credModalKey" rows="6" spellcheck="false" autocomplete="off"
+                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+                style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:10px;"></textarea>
+      <input type="file" id="credModalKeyFile" onchange="credModalLoadKeyFile(this)" style="margin:6px 0 12px;font-size:11px;">
+      <label style="font-size:10px;font-weight:700;color:var(--text2);display:block;
+             margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;">{T("Passphrase (opzionale)")}</label>
+      <input type="password" id="credModalPassphrase" style="width:100%;box-sizing:border-box;" autocomplete="new-password">
+      <div style="font-size:10px;color:var(--text3);margin-top:6px;">{T("Una chiave senza passphrase e protetta solo dalla cifratura di questa applicazione.")}</div>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;">
       <button onclick="closeCredModal()" class="btn">{T("Annulla")}</button>
@@ -10743,14 +10963,27 @@ async function doReveal() {{
                   onclick="navigator.clipboard.writeText(document.getElementById('revealUser').textContent)">⎘</button>
         </div>
       </div>
-      <div style="margin-bottom:20px;">
+      <div id="revealPassBox" style="margin-bottom:20px;">
         <div style="font-size:10px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px;">{T("Password")}</div>
         <div style="display:flex;gap:6px;align-items:center;">
           <code id="revealPass" style="flex:1;background:var(--bg3);border:1px solid var(--border2);
                 border-radius:6px;padding:7px 10px;font-size:13px;color:var(--text);font-family:var(--mono);"></code>
           <button class="btn" style="padding:3px 8px;font-size:10px;"
-                  onclick="navigator.clipboard.writeText(document.getElementById('revealPass').textContent)">⎘</button>
+                  onclick="copyRevealText('revealPass')">⎘</button>
         </div>
+      </div>
+      <div id="revealKeyBox" style="margin-bottom:20px;display:none;">
+        <div style="font-size:10px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px;">{T("Impronta chiave")}</div>
+        <code id="revealFp" style="display:block;background:var(--bg3);border:1px solid var(--border2);
+              border-radius:6px;padding:7px 10px;font-size:12px;color:var(--text);font-family:var(--mono);word-break:break-all;margin-bottom:10px;"></code>
+        <div style="font-size:10px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px;">{T("Chiave pubblica")}</div>
+        <div style="display:flex;gap:6px;align-items:flex-start;">
+          <code id="revealPub" style="flex:1;background:var(--bg3);border:1px solid var(--border2);
+                border-radius:6px;padding:7px 10px;font-size:11px;color:var(--text);font-family:var(--mono);word-break:break-all;"></code>
+          <button class="btn" style="padding:3px 8px;font-size:10px;"
+                  onclick="copyRevealText('revealPub')">⎘</button>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:6px;">{T("La chiave privata non viene mai mostrata.")}</div>
       </div>
       <div style="font-size:10px;color:var(--text3);margin-bottom:14px;">
         ! {T("Chiudi questa finestra appena hai copiato le credenziali.")}
@@ -10870,7 +11103,7 @@ async function doReveal() {{
             "custom":    T("Personalizzato"),
             "": "—"})
         cred_sets_js = json.dumps([
-            {"id": c["id"], "name": c["name"]}
+            {"id": c["id"], "name": _cred_label(c)}
             for c in CRED_SETS])
         groups_js = json.dumps(sorted({r.get("group","") for r in ROUTERS if r.get("group","")}))
 
@@ -11077,7 +11310,7 @@ dialog::backdrop{{background:rgba(0,0,0,.55);}}
       <label>Credenziali SSH &nbsp;<a href="/credentials" style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">Apri Credential Manager</a></label>
       <select id="dlgSiteCred">
         <option value="">-- Credenziali del singolo router --</option>
-        {"".join(f'<option value="{c["id"]}">{c["name"]}</option>' for c in CRED_SETS)}
+        {"".join(f'<option value="{c["id"]}">{_esc(_cred_label(c))}</option>' for c in CRED_SETS)}
       </select></div>
     <div id="dlgSiteMsg" class="dlg-msg"></div>
     <div class="dlg-actions">
@@ -12012,7 +12245,7 @@ function topoSavePos() {{
         offline = total - online
 
         # Credential sets for the device credentials modal (name only, no passwords)
-        cred_sets_js = json.dumps([{"id": c["id"], "name": c["name"]} for c in CRED_SETS])
+        cred_sets_js = json.dumps([{"id": c["id"], "name": _cred_label(c)} for c in CRED_SETS])
 
         # In-app tour overlay (injected when ?tour=2 is in the URL)
         _qs_main = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -12714,7 +12947,7 @@ async function saveCredsModal() {{
     def render_discovery_page(self, session=None):
         devices_js = json.dumps({ip: {"group": d.get("group",""), "tags": d.get("tags",[])}
                                   for ip, d in DEVICES.items()})
-        disc_cred_sets_js = json.dumps([{"id": c["id"], "name": c["name"], "username": _cred_set_username(c)} for c in CRED_SETS])
+        disc_cred_sets_js = json.dumps([{"id": c["id"], "name": _cred_label(c), "username": _cred_set_username(c)} for c in CRED_SETS])
         sites_for_disc_js = json.dumps([
             {"id": sid, "name": s.get("name", sid)}
             for sid, s in sorted(SITES.items(), key=lambda x: x[1].get("name", ""))
@@ -13223,7 +13456,7 @@ function discSort(col) {{
       </div>
       <select id="upCredPicker" style="width:100%;box-sizing:border-box;font-size:12px;margin-bottom:4px;">
         <option value="">— {T("Automatico: usa le credenziali del sito o del router")} —</option>
-        {chr(10).join(f'        <option value="{c["id"]}">{c["name"]}</option>' for c in CRED_SETS)}
+                {chr(10).join(f'        <option value="{c["id"]}">{_esc(_cred_label(c))}</option>' for c in CRED_SETS)}
       </select>
       {"" if CRED_SETS else f'<div style="font-size:10px;color:var(--text3);font-style:italic;margin-bottom:4px;">{T("Nessun set credenziali configurato.")} <a href="/credentials" style="color:var(--accent);">{T("Creane uno nel Credential Manager")} →</a></div>'}
     </div>
@@ -14366,7 +14599,7 @@ _draw();
       </div>
       <select id="upgCredPicker" style="width:100%;box-sizing:border-box;font-size:12px;margin-bottom:4px;">
         <option value="">— {"Automatic: device / site credentials" if lang_en else "Automatico: credenziali dispositivo / sito"} —</option>
-        {chr(10).join(f'        <option value="{c["id"]}">{c["name"]}</option>' for c in CRED_SETS)}
+                {chr(10).join(f'        <option value="{c["id"]}">{_esc(_cred_label(c))}</option>' for c in CRED_SETS)}
       </select>
       {"" if CRED_SETS else f'<div style="font-size:10px;color:var(--text3);font-style:italic;margin-bottom:4px;">{"No credentials configured." if lang_en else "Nessuna credenziale configurata."} <a href="/credentials" style="color:var(--accent);">{"Create one" if lang_en else "Creane una"} →</a></div>'}
     </div>
