@@ -57,8 +57,11 @@ from collections import deque
 from datetime import datetime
 import urllib.parse
 import paramiko
-import cgi
 import io as _io
+import tempfile as _tempfile
+from email.message import Message as _EmailMessage
+from email.parser import BytesParser as _BytesParser
+from email.policy import default as _email_policy
 from http.server import ThreadingHTTPServer
 try:
     import pyotp, segno
@@ -786,6 +789,7 @@ def _set_language(lang: str):
     cfg["language"] = lang
     _save_app_config(cfg)
 UPLOAD_DIR       = os.path.join(BASE_DIR, "uploads")
+MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────
@@ -2633,11 +2637,151 @@ def _start_rtm():
 # ─────────────────────────────────────────────────────────────────
 # § Upload helpers
 # ─────────────────────────────────────────────────────────────────
+class _FormParseError(ValueError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+class _UploadedFormFile:
+    def __init__(self, filename, content):
+        self.filename = filename
+        self.file = _io.BytesIO(content)
+
+
+class _ParsedPostForm:
+    def __init__(self):
+        self.values = {}
+
+    def add(self, name, value):
+        if name in self.values:
+            existing = self.values[name]
+            self.values[name] = existing + [value] if isinstance(existing, list) else [existing, value]
+        else:
+            self.values[name] = value
+
+    def getvalue(self, name, default=None):
+        return self.values.get(name, default)
+
+    def __contains__(self, name):
+        return name in self.values
+
+    def __getitem__(self, name):
+        return self.values[name]
+
+
+def _parse_content_length(headers):
+    raw_length = headers.get("Content-Length", "0")
+    if not raw_length.isascii() or not raw_length.isdecimal():
+        raise _FormParseError("Content-Length non valido")
+    try:
+        return int(raw_length)
+    except ValueError as exc:
+        raise _FormParseError("Content-Length non valido") from exc
+
+
+def _parse_post_form(stream, headers, content_length):
+    if "Content-Length" not in headers and headers.get("Content-Type"):
+        raise _FormParseError(
+            "Content-Length richiesto per i dati del form", status=411)
+    if content_length < 0:
+        raise _FormParseError("Lunghezza del body non valida")
+    if content_length > MAX_UPLOAD_SIZE_BYTES:
+        raise _FormParseError(
+            f"Body troppo grande: limite di {MAX_UPLOAD_SIZE_BYTES} byte",
+            status=413)
+
+    # Bound the body before the standard-library MIME parser builds its tree.
+    body = stream.read(content_length)
+    if len(body) != content_length:
+        raise _FormParseError("Body della richiesta incompleto")
+
+    form = _ParsedPostForm()
+    if not body:
+        return form
+
+    content_type = headers.get("Content-Type", "")
+    if "\r" in content_type or "\n" in content_type:
+        raise _FormParseError("Content-Type non valido")
+    content_type_header = _EmailMessage()
+    try:
+        content_type_header["Content-Type"] = content_type
+    except ValueError as exc:
+        raise _FormParseError("Content-Type non valido") from exc
+
+    media_type = content_type_header.get_content_type().lower()
+    if media_type == "application/x-www-form-urlencoded":
+        try:
+            decoded_body = body.decode("utf-8", errors="replace")
+            fields = urllib.parse.parse_qs(
+                decoded_body, keep_blank_values=True, errors="replace")
+        except ValueError as exc:
+            raise _FormParseError("Dati form non validi") from exc
+        for name, values in fields.items():
+            form.add(name, values[0] if len(values) == 1 else values)
+        return form
+
+    if media_type != "multipart/form-data":
+        raise _FormParseError("Content-Type non supportato", status=415)
+
+    boundary = content_type_header.get_param("boundary")
+    if not isinstance(boundary, str) or not boundary or len(boundary) > 70:
+        raise _FormParseError("Boundary multipart mancante o non valido")
+    try:
+        synthetic_headers = (
+            b"Content-Type: " + content_type.encode("ascii") +
+            b"\r\nMIME-Version: 1.0\r\n\r\n"
+        )
+    except UnicodeEncodeError as exc:
+        raise _FormParseError("Content-Type multipart non valido") from exc
+
+    message = _BytesParser(policy=_email_policy).parsebytes(synthetic_headers + body)
+    if message.get_content_type().lower() != "multipart/form-data" or not message.is_multipart():
+        raise _FormParseError("Body multipart malformato")
+    if any(part.defects for part in message.walk()):
+        raise _FormParseError("Body multipart malformato")
+
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            raise _FormParseError("Parte multipart non valida")
+        name = part.get_param("name", header="content-disposition")
+        if not isinstance(name, str) or not name:
+            raise _FormParseError("Nome campo multipart mancante")
+        if part.is_multipart():
+            raise _FormParseError("Parti multipart annidate non supportate")
+
+        filename = part.get_filename()
+        content = part.get_payload(decode=True)
+        if content is None:
+            content = b""
+        if filename is not None:
+            if len(content) > MAX_UPLOAD_SIZE_BYTES:
+                raise _FormParseError(
+                    f"File troppo grande: limite di {MAX_UPLOAD_SIZE_BYTES} byte",
+                    status=413)
+            form.add(name, _UploadedFormFile(filename, content))
+        else:
+            form.add(name, content.decode("utf-8", errors="replace"))
+    return form
+
+
 def _save_upload(fileitem):
     filename = os.path.basename(fileitem.filename)
     path     = os.path.join(UPLOAD_DIR, filename)
-    with open(path, "wb") as f:
-        f.write(fileitem.file.read())
+    temporary_path = None
+    try:
+        with _tempfile.NamedTemporaryFile(
+                mode="wb", dir=UPLOAD_DIR, prefix=".upload-", delete=False) as f:
+            temporary_path = f.name
+            while True:
+                chunk = fileitem.file.read(64 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
     return filename, path
 
 def _update_router_script(ip, path, filename):
@@ -5445,7 +5589,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_post(self):
         import sys
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            length = _parse_content_length(self.headers)
+        except _FormParseError as exc:
+            self.close_connection = True
+            return self._json({"ok": False, "msg": str(exc)}, status=exc.status)
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return self._json({"ok": False, "msg": "Transfer-Encoding non supportato"}, status=400)
         ctype  = self.headers.get("Content-Type", "")
         # Use parsed path to strip any query string
         path   = urllib.parse.urlparse(self.path).path
@@ -5596,8 +5747,8 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_do_restart_after_update, daemon=False).start()
             return
 
-        # ── JSON body endpoints — handle BEFORE cgi.FieldStorage ────
-        # FieldStorage consumes rfile; JSON endpoints must read first and return early.
+        # ── JSON body endpoints — handle before form parsing ─────────
+        # JSON endpoints consume rfile and must return before form parsing.
         JSON_PATHS = {"/api/scan", "/api/add_devices",
                       "/api/device/tag", "/api/device/creds", "/api/device/remove",
                       "/api/tags/add", "/api/tags/remove",
@@ -6075,13 +6226,12 @@ class Handler(BaseHTTPRequestHandler):
                 save_json_atomic(USERS_FILE, USERS)
                 return self.redirect("/users?ok=changed")
 
-        # ---- Multipart form data (file uploads) ────────────────────
-        env = {
-            "REQUEST_METHOD": "POST",
-            "CONTENT_TYPE":   ctype,
-            "CONTENT_LENGTH": str(length),
-        }
-        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ=env)
+        # ---- Form data (including multipart uploads) ────────────────
+        try:
+            form = _parse_post_form(self.rfile, self.headers, length)
+        except _FormParseError as exc:
+            self.close_connection = True
+            return self._json({"ok": False, "msg": str(exc)}, status=exc.status)
 
         # ── RouterOS upgrade: job-based check (terminal monitor) ──────
         if path == "/api/ros-check-start":
@@ -11991,9 +12141,9 @@ function topoSavePos() {{
 """, session=session, page_key="topology")
 
 
-    def _json(self, data):
+    def _json(self, data, status=200):
         body = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-type", "application/json")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
