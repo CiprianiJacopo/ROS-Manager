@@ -49,7 +49,7 @@ Explanations of the "why" behind non-obvious choices that you can't get just fro
 
 Because of this:
 - `_tcp_reachable()` (a TCP connect on common ports: 22, 8291, 8728, 80, 443, 23) replaced `subprocess.run(ping)` for the reachability check in `fingerprint_host()` and `_ping_one()`. No fork, no crash.
-- `_get_mac_from_arp()` entirely skips the `subprocess.check_output(["arp", ...])` call on macOS (`sys.platform == "darwin"`) — same crash (the MAC via ARP is purely cosmetic, for OUI vendor lookup). It stays active only on Windows, where `subprocess` doesn't `fork()` so there's no problem there. On RouterOS routers with SSH credentials configured, the MAC still arrives via SSH (`_ssh_connect_creds`), a different and safe code path.
+- `_get_mac_from_arp()` entirely skips the `subprocess.check_output(["arp", ...])` call on macOS (`sys.platform == "darwin"`) — same crash (the MAC via ARP is purely cosmetic, for OUI vendor lookup). It stays active only on Windows, where `subprocess` doesn't `fork()` so there's no problem there. On RouterOS routers with SSH credentials configured, the MAC still arrives via SSH (`_ssh_connect_cred`), a different and safe code path.
 - The 3 spots that restart the process (`/settings/access-restart`, `/api/restart`, `/api/do-update`) set `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` in the environment passed to `subprocess.Popen(...)`, because there the fork is unavoidable (a new Python process genuinely needs to be launched). **Note:** this variable acts on the CHILD process's environment after exec — it's not certain it prevents the crash, which happens inside `fork()` itself, before exec. It was kept as a precautionary mitigation at those 3 spots (where the fork is mandatory and can't be eliminated), but it should not be considered a proven fix: the tested pattern remains "eliminate the fork" (see `_tcp_reachable`/`_get_mac_from_arp`), not "suppress the crash with an env var".
 - If another `subprocess.*` call reached at runtime (not at cold start, when the process is still single-threaded) is needed in the future, evaluate a no-fork alternative first — don't trust `OBJC_DISABLE_INITIALIZE_FORK_SAFETY` as a fix.
 
@@ -71,6 +71,16 @@ You can choose which network interfaces to publish ROSM on, even more than one a
 ### Network Discovery — SSH credentials are optional
 
 `fingerprint_host()` works even without `ssh_user`/`ssh_pass`: it still detects IP, open ports, device type (via SSH/HTTP banner, MAC OUI). Credentials are only needed for the next step (reading RouterOS identity/model via SSH) — neither the backend (`/api/scan`) nor the frontend require credentials to start a scan anymore.
+
+### Credential sets — password and SSH key types
+
+Sets in `cred_sets.json` carry an optional `type`: absent or `"password"` is the original password set, `"ssh_key"` holds a private key. Secrets (`password_enc`, `private_key_enc`, `passphrase_enc`) are Fernet-encrypted like the rest of the file. Key sets also store non-secret `key_type`, `fingerprint` (`SHA256:...`) and `public_key`, computed when the key is saved.
+
+- Code never passes `(user, pass)` tuples around. `_resolve_credential()`, `_get_credential_for_site()` and `_get_device_credential()` return a credential object `{type, username, password, [private_key, passphrase]}`.
+- `_ssh_connect_cred(ip, cred)` is the only place that builds an SSH connection; `_ssh_auth_kwargs()` turns the credential into paramiko arguments (`password=` or `pkey=`). A new credential type (SSH certificate, TLS client certificate) is added there and in `_cred_set_to_credential()`.
+- `_load_private_key()` accepts Ed25519, ECDSA and RSA keys (max 16 KiB) and rejects missing or wrong passphrases.
+- The private key is never sent back to the browser. `_cred_set_public()` is the only browser-safe shape, and Reveal returns just the username, fingerprint and public key for key sets. To use a key, copy the public key from the Credential Manager and import it on the router (`/user ssh-keys import public-key-file=... user=...`).
+- Key sets are assignable to a single device (`credential_id`) as well as to sites. Key generation is not supported yet, only paste or upload.
 
 ### Duplicate app bundles in /Applications — "ROSM.localized" folders
 
