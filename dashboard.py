@@ -15435,7 +15435,13 @@ window._rosmDbgDeactivate=async function(){{
             key=lambda x: -len(x[0])
         )
         for it_str, en_str in pairs:
-            html = html.replace(it_str, en_str)
+            if it_str.isalnum():
+                # Single words must not match inside identifiers or other words
+                # (e.g. "Data" in FormData, "Crea" in "Create").
+                html = re.sub(r"(?<!\w)" + re.escape(it_str) + r"(?!\w)",
+                              lambda _m, _e=en_str: _e, html)
+            else:
+                html = html.replace(it_str, en_str)
         return html
 
     def respond(self, html: str) -> None:
