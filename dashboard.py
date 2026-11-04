@@ -605,6 +605,7 @@ _T_EN: dict = {
         "Select a credential set or enter username and password before adding devices.",
     "dispositivi aggiunti": "devices added",
     "→ Vai alla lista": "→ Go to list",
+    "→ Vai al Site Manager": "→ Go to Site Manager",
     "Aggiorna SSH": "Refresh SSH",
     "Avvia un ping": "Run ping",
     "Ping massivo": "Bulk ping",
