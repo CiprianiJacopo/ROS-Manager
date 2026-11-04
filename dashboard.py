@@ -221,6 +221,8 @@ _T_EN: dict = {
     "Site Manager": "Site Manager", "Network Discovery": "Network Discovery",
     "Statistiche": "Statistics", "Carica Script": "Upload Script",
     "Guida": "Guide",
+    "Nessun aggiornamento scaricato — esegui prima il download": "No downloaded update — run Download first",
+    "Update avviato — il router si riavvierà": "Update started — the router will reboot",
     "Funzioni, ruoli e istruzioni rapide": "Features, roles and quick instructions",
     "Credential Manager": "Credential Manager", "Backup Manager": "Backup Manager",
     "Utenti": "Users", "Riavvia": "Restart", "Logout": "Logout",
@@ -5039,6 +5041,7 @@ class Handler(BaseHTTPRequestHandler):
             "/upload_npk":              "upgrade",
             "/api/ros-check-start":     "upgrade",
             "/api/ros-download":        "upgrade",
+            "/api/ros-reboot":          "upgrade",
             "/api/ros-install":         "upgrade",
             "/settings/password":     None,
             "/settings/profile":      None,
@@ -6290,6 +6293,71 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 _ex_dl.shutdown(wait=False)
             return self._json({"ok": True, "results": results_dl})
+
+        if path == "/api/ros-reboot":
+            # Install only — reboot routers that already have a downloaded update
+            ips_raw    = form.getvalue("ips", "")
+            cred_id_rb = form.getvalue("cred_id", "")
+            ips = [ip.strip() for ip in ips_raw.split(",") if ip.strip()]
+            if not ips:
+                return self._json({"ok": False, "msg": "Nessun router selezionato"})
+            def _ros_reboot_one(ip_):
+                name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
+                if cred_id_rb:
+                    u, p = _resolve_cred_id(cred_id_rb)
+                else:
+                    u, p = _get_device_creds(ip_)
+                if not u:
+                    return {"ip": ip_, "name": name_, "ok": False,
+                            "msg": "Credenziali SSH non configurate"}
+                try:
+                    ssh = _ssh_connect_creds(ip_, u, p)
+                    _, out, _ = ssh.exec_command("/system package update print")
+                    out.channel.settimeout(15)
+                    try:
+                        status = out.read().decode(errors="ignore")
+                    except socket.timeout:
+                        status = ""
+                    if "downloaded" not in status.lower():
+                        try: ssh.close()
+                        except Exception: pass
+                        return {"ip": ip_, "name": name_, "ok": False,
+                                "msg": "Nessun aggiornamento scaricato — esegui prima il download"}
+                    # The connection drops as the router goes down
+                    try:
+                        ssh.exec_command("/system reboot")
+                        time.sleep(1)
+                        ssh.close()
+                    except Exception:
+                        pass
+                    app_log("system", "info", f"RouterOS install (riavvio) avviato su {ip_}")
+                    return {"ip": ip_, "name": name_, "ok": True,
+                            "msg": "Update avviato — il router si riavvierà"}
+                except Exception as e_:
+                    return {"ip": ip_, "name": name_, "ok": False, "msg": _ssh_err_str(e_)}
+            results_rb = []
+            _ex_rb = ThreadPoolExecutor(max_workers=min(len(ips), 16))
+            try:
+                futs_rb = {_ex_rb.submit(_ros_reboot_one, ip): ip for ip in ips}
+                try:
+                    for fut in as_completed(futs_rb, timeout=60):
+                        try:   results_rb.append(fut.result())
+                        except Exception as e_:
+                            ip_ = futs_rb[fut]
+                            name_ = next((rr.get("name","") for rr in ROUTERS
+                                          if rr["ip"] == ip_), "")
+                            results_rb.append({"ip": ip_, "name": name_,
+                                               "ok": False, "msg": _ssh_err_str(e_)})
+                except FuturesTimeout:
+                    for fut, ip_ in futs_rb.items():
+                        if not fut.done():
+                            name_ = next((rr.get("name","") for rr in ROUTERS
+                                          if rr["ip"] == ip_), "")
+                            results_rb.append({"ip": ip_, "name": name_,
+                                               "ok": False, "msg": "Timeout"})
+            finally:
+                _ex_rb.shutdown(wait=False)
+            return self._json({"ok": True, "results": results_rb})
 
         # ── RouterOS upgrade via .npk upload ───────────────────────────
         if path == "/upload_npk":
@@ -14409,6 +14477,11 @@ _draw();
                   style="background:var(--accent2);color:#fff;border-color:var(--accent2);">
             {"Download only" if lang_en else "Solo download"}
           </button>
+          <button class="btn" id="upgRebootBtn" onclick="upgRebootInstall()" disabled
+                  title="{"Installs an already downloaded update by rebooting the router" if lang_en else "Installa un aggiornamento già scaricato riavviando il router"}"
+                  style="background:var(--yellow);color:#fff;border-color:var(--yellow);">
+            {"Install only (reboot)" if lang_en else "Solo installa (riavvio)"}
+          </button>
           <button class="btn" id="upgInstallBtn" onclick="upgInstallOnline()" disabled
                   style="background:var(--red);color:#fff;border-color:var(--red);">
             {"Download &amp; Install" if lang_en else "Scarica &amp; Installa"}
@@ -14587,6 +14660,7 @@ async function upgCheckOnline() {{
   if(!ips.length){{alert('{"Select at least one router." if lang_en else "Seleziona almeno un router."}');return;}}
   checkBtn.disabled=true;
   document.getElementById('upgInstallBtn').disabled=true;
+  document.getElementById('upgRebootBtn').disabled=true;
   document.getElementById('upgDownloadBtn').disabled=true;
   var terminal=document.getElementById('upgTerminal');
   var rl=document.getElementById('upgOnlineResults');
@@ -14642,6 +14716,7 @@ function _upgPollCheckJob(job_id, total, seen, checkBtn) {{
           +'  OK '+ok+'  x '+fail, hasUpd?'#d29922':'#3fb950');
         checkBtn.disabled=false;
         document.getElementById('upgInstallBtn').disabled=(hasUpd===0);
+        document.getElementById('upgRebootBtn').disabled=(hasUpd===0);
         document.getElementById('upgDownloadBtn').disabled=(hasUpd===0);
         // Show results list
         var rl=document.getElementById('upgOnlineResults');
@@ -14679,6 +14754,7 @@ async function upgDownloadOnly() {{
   if(!confirm('{"Download updates on selected routers (no reboot)?" if lang_en else "Scaricare gli aggiornamenti sui router selezionati (senza riavvio)?"}'))return;
   document.getElementById('upgDownloadBtn').disabled=true;
   document.getElementById('upgInstallBtn').disabled=true;
+  document.getElementById('upgRebootBtn').disabled=true;
   document.getElementById('upgCheckBtn').disabled=true;
   document.getElementById('upgTerminal').innerHTML='';
   upgTermLine('{"Downloading updates (no install)…" if lang_en else "Download aggiornamenti (senza installazione)…"}','#79c0ff');
@@ -14690,9 +14766,10 @@ async function upgDownloadOnly() {{
     var r=await fetch('/api/ros-download',{{method:'POST',body:fd}});
     var d=await r.json();
     document.getElementById('upgDownloadBtn').disabled=false;
+    document.getElementById('upgRebootBtn').disabled=false;
     document.getElementById('upgCheckBtn').disabled=false;
     if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
-    upgTermLine('{"Download complete. Ready to install." if lang_en else "Download completato. Pronto per installazione."}','#3fb950');
+    upgTermLine('{"Download complete. Ready to install."  if lang_en else "Download completato. Pronto per installazione."}','#3fb950');
     var rl=document.getElementById('upgOnlineResults');
     rl.style.display='block';
     rl.innerHTML=d.results.map(function(row){{
@@ -14704,9 +14781,46 @@ async function upgDownloadOnly() {{
         +'<span class="upg-res-ver '+cls+'">'+(row.msg||'')+'</span></div>';
     }}).join('');
     document.getElementById('upgInstallBtn').disabled=false;
+    document.getElementById('upgRebootBtn').disabled=false;
   }} catch(e) {{
     document.getElementById('upgDownloadBtn').disabled=false;
     document.getElementById('upgCheckBtn').disabled=false;
+    upgTermLine('x '+e,'#f85149');
+  }}
+}}
+
+async function upgRebootInstall() {{
+  var ips=upgGetIPs();
+  if(!ips.length){{alert('{"Select at least one router." if lang_en else "Seleziona almeno un router."}');return;}}
+  if(!confirm('{"Reboot the selected routers to install the downloaded update?" if lang_en else "Riavviare i router selezionati per installare gli aggiornamenti scaricati?"}'))return;
+  var btns=['upgRebootBtn','upgInstallBtn','upgDownloadBtn','upgCheckBtn'];
+  btns.forEach(function(b){{document.getElementById(b).disabled=true;}});
+  document.getElementById('upgTerminal').innerHTML='';
+  upgTermLine('{"Installing downloaded update (reboot)…" if lang_en else "Installazione aggiornamento scaricato (riavvio)…"}','#79c0ff');
+  var fd=new URLSearchParams();
+  fd.append('ips',ips.join(','));
+  fd.append('cred_id',_upgGetCred());
+  function _enable(){{btns.forEach(function(b){{document.getElementById(b).disabled=false;}});}}
+  try {{
+    var r=await fetch('/api/ros-reboot',{{method:'POST',body:fd}});
+    var d=await r.json();
+    _enable();
+    if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
+    d.results.forEach(function(row){{
+      upgTermLine((row.ok?'OK ':'x ')+row.ip+(row.name?' ('+row.name+')':'')+' — '+(row.msg||''),
+                  row.ok?'#3fb950':'#f85149');
+    }});
+    var rl=document.getElementById('upgOnlineResults');
+    rl.style.display='block';
+    rl.innerHTML=d.results.map(function(row){{
+      return '<div class="upg-res-row">'
+        +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
+        +'<span class="upg-res-ip">'+row.ip+'</span>'
+        +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
+        +'<span class="upg-res-ver '+(row.ok?'ok':'fail')+'">'+(row.msg||'')+'</span></div>';
+    }}).join('');
+  }} catch(e) {{
+    _enable();
     upgTermLine('x '+e,'#f85149');
   }}
 }}
@@ -14716,6 +14830,7 @@ async function upgInstallOnline() {{
   if(!ips.length){{alert('! {T("Seleziona almeno un router.")}');return;}}
   if(!confirm('{"Install updates and reboot the selected routers?" if lang_en else "Installare gli aggiornamenti e riavviare i router selezionati?"}'))return;
   document.getElementById('upgInstallBtn').disabled=true;
+  document.getElementById('upgRebootBtn').disabled=true;
   document.getElementById('upgDownloadBtn').disabled=true;
   document.getElementById('upgCheckBtn').disabled=true;
   document.getElementById('upgTerminal').innerHTML='';
@@ -14728,6 +14843,7 @@ async function upgInstallOnline() {{
     var r=await fetch('/api/ros-install',{{method:'POST',body:fd}});
     var d=await r.json();
     document.getElementById('upgInstallBtn').disabled=false;
+    document.getElementById('upgRebootBtn').disabled=false;
     document.getElementById('upgDownloadBtn').disabled=false;
     document.getElementById('upgCheckBtn').disabled=false;
     if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
@@ -14744,6 +14860,7 @@ async function upgInstallOnline() {{
     }}).join('');
   }} catch(e) {{
     document.getElementById('upgInstallBtn').disabled=false;
+    document.getElementById('upgRebootBtn').disabled=false;
     document.getElementById('upgDownloadBtn').disabled=false;
     document.getElementById('upgCheckBtn').disabled=false;
     upgTermLine('x '+e,'#f85149');
