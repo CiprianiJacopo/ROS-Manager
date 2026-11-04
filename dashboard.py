@@ -3835,7 +3835,7 @@ function _updateBulkBar(){
 async function bulkDelete(){
   var ips=_getSelectedIPs();
   if(ips.length<2){return;}
-  if(!confirm('Eliminare '+ips.length+' router dalla lista?\n\nQuesta operazione rimuove i device dalla dashboard e da devices.json. Non influisce sui dispositivi fisici.')) return;
+  if(!confirm(ROSM_LANG==='en' ? 'Remove '+ips.length+' router(s) from the list?\n\nThis removes the devices from the dashboard and from devices.json. It does not affect the physical devices.' : 'Eliminare '+ips.length+' router dalla lista?\n\nQuesta operazione rimuove i device dalla dashboard e da devices.json. Non influisce sui dispositivi fisici.')) return;
   var errors=[];
   for(var i=0;i<ips.length;i++){
     try{
@@ -4090,7 +4090,7 @@ async function refreshCustomCol(id) {
 // Remove device
 // ================================================================
 async function removeDevice(ip) {
-  if(!confirm('Rimuovere '+ip+' dalla lista?')) return;
+  if(!confirm(ROSM_LANG==='en' ? 'Remove '+ip+' from the list?' : 'Rimuovere '+ip+' dalla lista?')) return;
   try {
     await fetch('/api/device/remove',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -10567,7 +10567,7 @@ function bkPgNext() {{
 }}
 
 async function deleteFile(fname) {{
-  if(!confirm('Eliminare ' + fname + '?')) return;
+  if(!confirm(ROSM_LANG==='en' ? 'Delete ' + fname + '?' : 'Eliminare ' + fname + '?')) return;
   await fetch('/api/backup/delete', {{method:'POST',
     headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{file:fname}})}});
   refreshFiles();
@@ -11450,7 +11450,7 @@ async function saveSite(){{
   }}catch(e){{msg.textContent='Errore di rete: '+e;}}
 }}
 async function delSite(id){{
-  if(!confirm('Eliminare "'+((SD[id]&&SD[id].name)||id)+'"?'))return;
+  var _dn=((SD[id]&&SD[id].name)||id); if(!confirm(ROSM_LANG==='en' ? 'Delete "'+_dn+'"?' : 'Eliminare "'+_dn+'"?'))return;
   try{{
     var r=await fetch('/api/sites/remove',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}});
     var j=await r.json();if(!j.ok){{alert('Errore');return;}}
