@@ -516,6 +516,10 @@ _T_EN: dict = {
     "Nessun dato disponibile.": "No data available.",
     "Nessun dispositivo trovato.": "No devices found.",
     "Nessun router trovato.": "No routers found.",
+    "Seleziona questi router nella pagina Upgrade": "Select these routers on the Upgrade page",
+    "router alla versione": "routers on version",
+    "preselezionati": "preselected",
+    "Nessun router con la versione": "No routers on version",
     "Nessun set credenziali. Premi &quot;+ Nuove credenziali&quot; per iniziare.":
         "No credential sets. Press &quot;+ New Credentials&quot; to begin.",
     "Non assegnato": "Unassigned",
@@ -13476,7 +13480,7 @@ function pollJob(job_id, total, bar, msg, btn, rlist) {{
                     f'<div class="kpi-label">{label}</div>'
                     f'<div class="kpi-sub">{sub}</div></div>')
 
-        def bar_chart(data, palette, label_width=120):
+        def bar_chart(data, palette, label_width=120, link=None):
             if not data:
                 return f'<div style="color:var(--text3);font-size:11px;padding:8px 0;">{T("Nessun dato disponibile.")}</div>'
             mx = max(v for _, v in data)
@@ -13484,10 +13488,14 @@ function pollJob(job_id, total, bar, msg, btn, rlist) {{
             for i, (k, v) in enumerate(data):
                 pct = round(v / mx * 100, 1) if mx else 0
                 col = palette[i % len(palette)]
-                rows += (f'<div class="bar-row">'
-                         f'<span class="bar-label" style="min-width:{label_width}px" title="{k}">{k}</span>'
-                         f'<div class="bar-track"><div class="bar-fill" style="width:{pct}%;background:{col}"></div></div>'
-                         f'<span class="bar-count">{v}</span></div>')
+                row = (f'<span class="bar-label" style="min-width:{label_width}px" title="{k}">{k}</span>'
+                       f'<div class="bar-track"><div class="bar-fill" style="width:{pct}%;background:{col}"></div></div>'
+                       f'<span class="bar-count">{v}</span>')
+                if link:
+                    tip = T("Seleziona questi router nella pagina Upgrade")
+                    rows += (f'<a class="bar-row bar-link" href="{link(k)}" title="{tip}">{row}</a>')
+                else:
+                    rows += f'<div class="bar-row">{row}</div>'
             return rows
 
         def donut(slices):
@@ -13861,7 +13869,8 @@ _draw();
             # Row 3: firmware + uptime
             card(T("Versione firmware RouterOS"),
                  bar_chart(fw_dist, [PALETTE[(i+2)%len(PALETTE)] for i in range(12)],
-                           label_width=90)) +
+                           label_width=90,
+                           link=lambda v: "/upgrade?version=" + urllib.parse.quote(v, safe=""))) +
             card(T("Distribuzione uptime"),
                  bar_chart(list(up_bkts.items()),
                            ["#4f8ef7","#22c55e","#f59e0b","#f78a4f","#ef4444","#3f4558"])) +
@@ -13905,6 +13914,9 @@ _draw();
 .kpi-label {{ font-size:11px;color:var(--text2);margin-top:4px;font-weight:600; }}
 .kpi-sub   {{ font-size:10px;color:var(--text3);margin-top:2px; }}
 .bar-row  {{ display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:11px; }}
+a.bar-link {{ text-decoration:none;color:inherit;border-radius:4px;cursor:pointer; }}
+a.bar-link:hover {{ background:rgba(79,142,247,.12); }}
+a.bar-link:hover .bar-label {{ color:var(--accent); }}
 .bar-label {{ color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right; }}
 .bar-track {{ flex:1;background:var(--bg3);border-radius:4px;height:14px; }}
 .bar-fill  {{ height:100%;border-radius:4px;transition:width .3s; }}
@@ -14259,6 +14271,9 @@ _draw();
             {"id": sid, "name": s.get("name", sid), "cred_id": s.get("credential_id", "")}
             for sid, s in sorted(SITES.items(), key=lambda x: x[1].get("name",""))
         ])
+        _pre_ver = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    .get("version", [""])[0].strip())
+        pre_ver_js = json.dumps(_pre_ver).replace("</", "<\\/")
         return self._page_shell(T("Aggiornamento RouterOS"), f"""
 <style>
 .upg-layout{{display:flex;gap:16px;height:calc(100vh - 80px);}}
@@ -14335,6 +14350,7 @@ _draw();
     <div class="upg-site-bar" id="upgSiteBtns">
       <button class="upg-site-btn active" data-site="" onclick="upgFilterSite(this,'')">{T("Tutti")}</button>
     </div>
+    <div id="upgPreNote" style="display:none;font-size:11px;color:var(--accent);"></div>
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <label style="display:flex;gap:6px;align-items:center;font-size:11px;color:var(--text2);cursor:pointer;">
         <input type="checkbox" id="upgSelAll" onchange="upgToggleAll(this)">
@@ -14495,7 +14511,31 @@ fetch('/api/state').then(r=>r.json()).then(d=>{{
     wrap.appendChild(b);
   }});
   upgRender(upgRouters);
+  upgPreselect();
 }});
+
+// Arriving from /stats?version=…: select every router on that version
+function upgPreselect() {{
+  var ver = {pre_ver_js};
+  if(!ver) return;
+  var note = document.getElementById('upgPreNote');
+  var n = 0, first = null;
+  document.querySelectorAll('.upg-check').forEach(function(cb) {{
+    var r = upgRouters.find(function(x) {{ return x.ip === cb.dataset.ip; }});
+    if(r && (r.packages||'').trim() === ver) {{
+      cb.checked = true;
+      cb.closest('.upg-ritem').classList.add('selected');
+      if(!first) first = cb.closest('.upg-ritem');
+      n++;
+    }}
+  }});
+  upgCount();
+  note.style.display = '';
+  note.textContent = n
+    ? n + ' {T("router alla versione")} ' + ver + ' {T("preselezionati")}'
+    : '{T("Nessun router con la versione")} ' + ver;
+  if(first) first.scrollIntoView({{block:'nearest'}});
+}}
 
 function upgFilterSite(el, sid) {{
   upgActiveSite = sid;
