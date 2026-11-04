@@ -606,6 +606,8 @@ _T_EN: dict = {
     "dispositivi aggiunti": "devices added",
     "→ Vai alla lista": "→ Go to list",
     "→ Vai al Site Manager": "→ Go to Site Manager",
+    "Avvio scansione…": "Starting scan…",
+    "Scansionati": "Scanned",
     "Aggiorna SSH": "Refresh SSH",
     "Avvia un ping": "Run ping",
     "Ping massivo": "Bulk ping",
