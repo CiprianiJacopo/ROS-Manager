@@ -221,6 +221,8 @@ _T_EN: dict = {
     "Site Manager": "Site Manager", "Network Discovery": "Network Discovery",
     "Statistiche": "Statistics", "Carica Script": "Upload Script",
     "Guida": "Guide",
+    "Nessun aggiornamento scaricato — esegui prima il download": "No downloaded update — run Download first",
+    "Update avviato — il router si riavvierà": "Update started — the router will reboot",
     "Funzioni, ruoli e istruzioni rapide": "Features, roles and quick instructions",
     "Credential Manager": "Credential Manager", "Backup Manager": "Backup Manager",
     "Utenti": "Users", "Riavvia": "Restart", "Logout": "Logout",
@@ -2171,6 +2173,97 @@ def refresh_router(r):
     with STATE_LOCK:
         SSH_ACTIVE -= 1
 
+def _upg_set(jid, ip, **kw):
+    with JOBS_LOCK:
+        job = JOBS.get(jid)
+        if job and ip in job.get("hosts", {}):
+            job["hosts"][ip].update(kw)
+
+def _upg_run_host(jid, ip, action, cred_id, channel):
+    """Run one upgrade action (download / install / reboot) on one router."""
+    name = next((rr.get("name", "") for rr in ROUTERS if rr["ip"] == ip), "")
+    def step(code):
+        _upg_set(jid, ip, state="running", step=code)
+    if cred_id:
+        user, pwd = _resolve_cred_id(cred_id)
+    else:
+        user, pwd = _get_device_creds(ip)
+    if not user:
+        return {"ip": ip, "name": name, "ok": False,
+                "msg": "Credenziali SSH non configurate"}
+    try:
+        step("connecting")
+        ssh = _ssh_connect_creds(ip, user, pwd)
+        if action == "reboot":
+            step("checking")
+            _, out, _ = ssh.exec_command("/system package update print")
+            status = _read_ssh_channel(out.channel, timeout=15)
+            if "downloaded" not in status.lower():
+                try: ssh.close()
+                except Exception: pass
+                return {"ip": ip, "name": name, "ok": False,
+                        "msg": "Nessun aggiornamento scaricato — esegui prima il download"}
+            step("rebooting")
+            # The connection drops as the router goes down
+            try:
+                ssh.exec_command("/system reboot")
+                time.sleep(1)
+                ssh.close()
+            except Exception:
+                pass
+            app_log("system", "info", f"RouterOS install (riavvio) avviato su {ip}")
+            return {"ip": ip, "name": name, "ok": True,
+                    "msg": "Update avviato — il router si riavvierà"}
+        if channel:
+            _, ch_out, _ = ssh.exec_command(f"/system package update set channel={channel}")
+            ch_out.channel.settimeout(10)
+            try: ch_out.read()
+            except Exception: pass
+        step("downloading")
+        _, out, _ = ssh.exec_command("/system package update download")
+        _read_ssh_channel(out.channel, timeout=90)
+        if action == "install":
+            step("installing")
+            _, out, _ = ssh.exec_command("/system package update install")
+            _read_ssh_channel(out.channel, timeout=15)
+        try: ssh.close()
+        except Exception: pass
+        if action == "install":
+            app_log("system", "info", f"RouterOS upgrade install avviato su {ip}")
+            return {"ip": ip, "name": name, "ok": True,
+                    "msg": "Update avviato — il router si riavvierà"}
+        app_log("system", "info", f"RouterOS download avviato su {ip}")
+        return {"ip": ip, "name": name, "ok": True,
+                "msg": "Download completato — pronto per installazione"}
+    except Exception as e:
+        return {"ip": ip, "name": name, "ok": False, "msg": _ssh_err_str(e)}
+
+def _upg_run_job(jid, ips, action, cred_id, channel):
+    def finish(ip, res):
+        with JOBS_LOCK:
+            job = JOBS[jid]
+            job["results"].append(res)
+            job["done"] += 1
+            job["hosts"][ip].update(state="ok" if res["ok"] else "failed",
+                                    step="", msg=res.get("msg", ""))
+    ex = ThreadPoolExecutor(max_workers=min(len(ips), 16))
+    try:
+        futs = {ex.submit(_upg_run_host, jid, ip, action, cred_id, channel): ip for ip in ips}
+        try:
+            for fut in as_completed(futs, timeout=300):
+                ip = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {"ip": ip, "name": "", "ok": False, "msg": _ssh_err_str(e)}
+                finish(ip, res)
+        except FuturesTimeout:
+            for fut, ip in futs.items():
+                if not fut.done():
+                    finish(ip, {"ip": ip, "name": "", "ok": False, "msg": "Timeout"})
+    finally:
+        ex.shutdown(wait=False)
+
 def refresh_all():
     for r in ROUTERS:
         if r["ssh_status"] in ("IDLE", "ERROR"):
@@ -2673,47 +2766,59 @@ def _bulk_job_worker(job_id, local_path, filename, targets):
             JOBS[job_id]["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
             JOBS[job_id]["done"] += 1
 
-def _upload_import_worker(job_id, local_path, filename, ips, run_after=True, cred_id=""):
-    """Background worker: SFTP push, then /import if run_after is True.
-    Credentials: if cred_id is provided it overrides per-device auto-resolve."""
+def _upload_import_host(job_id, ip, local_path, filename, run_after, cred_id):
+    """Push the script to one router (and /import it if requested); updates live host state."""
     remote = filename   # RouterOS SFTP root = flash
-    for ip in ips:
-        name = ""
-        try:
-            if cred_id:
-                username, password = _resolve_cred_id(cred_id)
-            else:
-                username, password = _get_device_creds(ip)
-            ssh  = _ssh_connect_creds(ip, username, password)
-            sftp = ssh.open_sftp()
-            sftp.put(local_path, remote)
-            sftp.close()
-            if run_after:
-                _, stdout, stderr = ssh.exec_command(f"/import file-name={remote}", timeout=30)
-                out = stdout.read().decode().strip()
-                err = stderr.read().decode().strip()
-                msg = out if out else (err if err else "OK")
-            else:
-                msg = "Uploaded"
-            ssh.close()
-            ok   = True
-            name = _update_router_script(ip, local_path, filename)
-        except Exception as e:
-            ok  = False
-            msg = _ssh_err_str(e)
-        with JOBS_LOCK:
-            JOBS[job_id]["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
-            JOBS[job_id]["done"] += 1
+    name = next((rr.get("name", "") for rr in ROUTERS if rr["ip"] == ip), "")
+    try:
+        _upg_set(job_id, ip, state="running", step="connecting")
+        if cred_id:
+            username, password = _resolve_cred_id(cred_id)
+        else:
+            username, password = _get_device_creds(ip)
+        ssh  = _ssh_connect_creds(ip, username, password)
+        _upg_set(job_id, ip, state="running", step="uploading")
+        sftp = ssh.open_sftp()
+        sftp.put(local_path, remote)
+        sftp.close()
+        if run_after:
+            _upg_set(job_id, ip, state="running", step="importing")
+            _, stdout, stderr = ssh.exec_command(f"/import file-name={remote}", timeout=30)
+            out = stdout.read().decode().strip()
+            err = stderr.read().decode().strip()
+            msg = out if out else (err if err else "OK")
+        else:
+            msg = "Uploaded"
+        ssh.close()
+        ok   = True
+        name = _update_router_script(ip, local_path, filename) or name
+    except Exception as e:
+        ok  = False
+        msg = _ssh_err_str(e)
+    with JOBS_LOCK:
+        job = JOBS[job_id]
+        job["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
+        job["done"] += 1
+        job["hosts"][ip].update(state="ok" if ok else "failed", step="", msg=msg)
+
+def _upload_import_worker(job_id, local_path, filename, ips, run_after=True, cred_id=""):
+    """Background worker: runs hosts in parallel. If cred_id is provided it overrides
+    per-device credential resolution."""
+    with ThreadPoolExecutor(max_workers=min(len(ips), 8) or 1) as ex:
+        for ip in ips:
+            ex.submit(_upload_import_host, job_id, ip, local_path, filename, run_after, cred_id)
 
 def start_upload_import_job(local_path, filename, ips, run_after=True, cred_id=""):
     job_id = str(uuid.uuid4())
+    names = {rr["ip"]: rr.get("name", "") for rr in ROUTERS}
     with JOBS_LOCK:
-        JOBS[job_id] = {"done": 0, "total": len(ips), "results": []}
+        JOBS[job_id] = {"done": 0, "total": len(ips), "results": [], "action": "upload",
+                        "hosts": {ip: {"state": "queued", "step": "", "name": names.get(ip, ""), "msg": ""}
+                                  for ip in ips}}
     threading.Thread(target=_upload_import_worker,
                      args=(job_id, local_path, filename, ips),
                      kwargs={"run_after": run_after, "cred_id": cred_id}, daemon=True).start()
     return job_id
-
 def start_bulk_job(local_path, filename, targets):
     """Start a background bulk-upload job. Returns job_id."""
     job_id = str(uuid.uuid4())
@@ -4827,13 +4932,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/job":
             job_id = qs.get("id", [""])[0]
             with JOBS_LOCK:
-                job = JOBS.get(job_id, {"done": 0, "total": 0, "results": []})
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(json.dumps(job).encode())
-            return
+                job = json.loads(json.dumps(
+                    JOBS.get(job_id, {"done": 0, "total": 0, "results": []})))
+            return self._json(job)
 
         if parsed.path == "/api/companies":
             out = {}
@@ -5039,6 +5140,7 @@ class Handler(BaseHTTPRequestHandler):
             "/upload_npk":              "upgrade",
             "/api/ros-check-start":     "upgrade",
             "/api/ros-download":        "upgrade",
+            "/api/ros-reboot":          "upgrade",
             "/api/ros-install":         "upgrade",
             "/settings/password":     None,
             "/settings/profile":      None,
@@ -6093,7 +6195,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "Nessun router selezionato"})
             job_id_chk = str(uuid.uuid4())
             with JOBS_LOCK:
-                JOBS[job_id_chk] = {"done": 0, "total": len(ips_chk), "results": []}
+                JOBS[job_id_chk] = {
+                    "done": 0, "total": len(ips_chk), "results": [], "action": "check",
+                    "hosts": {ip: {"state": "queued", "step": "",
+                                   "name": next((rr.get("name", "") for rr in ROUTERS
+                                                 if rr["ip"] == ip), "")}
+                              for ip in ips_chk},
+                }
             def _run_ros_check_job(jid, ip_list, _cred_id=cred_id_ck, _channel=channel_ck):
                 def _one(ip_):
                     name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
@@ -6105,7 +6213,9 @@ class Handler(BaseHTTPRequestHandler):
                         return {"ip": ip_, "name": name_, "ok": False,
                                 "msg": "Credenziali SSH non configurate"}
                     try:
+                        _upg_set(jid, ip_, state="running", step="connecting")
                         ssh = _ssh_connect_creds(ip_, u, p)
+                        _upg_set(jid, ip_, state="running", step="checking")
                         if _channel:
                             _, _co, _ = ssh.exec_command(
                                 f"/system package update set channel={_channel}")
@@ -6156,6 +6266,14 @@ class Handler(BaseHTTPRequestHandler):
                             with JOBS_LOCK:
                                 JOBS[jid]["results"].append(res)
                                 JOBS[jid]["done"] += 1
+                                if res["ok"]:
+                                    _msg = res["current"]
+                                    if res["latest"] != "?" and res["current"] != res["latest"]:
+                                        _msg += " -> " + res["latest"]
+                                else:
+                                    _msg = res.get("msg", "")
+                                JOBS[jid]["hosts"][res["ip"]].update(
+                                    state="ok" if res["ok"] else "failed", step="", msg=_msg)
                     except FuturesTimeout:
                         for fut, ip_ in futs.items():
                             if not fut.done():
@@ -6165,131 +6283,36 @@ class Handler(BaseHTTPRequestHandler):
                                     JOBS[jid]["results"].append(
                                         {"ip": ip_, "name": name_, "ok": False, "msg": "Timeout"})
                                     JOBS[jid]["done"] += 1
+                                    JOBS[jid]["hosts"][ip_].update(
+                                        state="failed", step="", msg="Timeout")
                 finally:
                     ex.shutdown(wait=False)
             threading.Thread(target=_run_ros_check_job,
                              args=(job_id_chk, ips_chk), daemon=True).start()
             return self._json({"ok": True, "job_id": job_id_chk, "total": len(ips_chk)})
 
-        if path == "/api/ros-install":
-            ips_raw    = form.getvalue("ips", "")
-            cred_id_in = form.getvalue("cred_id", "")
-            channel_in = form.getvalue("channel", "").strip()
-            ips = [ip.strip() for ip in ips_raw.split(",") if ip.strip()]
-            if not ips:
+        if path in ("/api/ros-download", "/api/ros-install", "/api/ros-reboot"):
+            # Job-based so the page can show live per-host progress
+            action_ = path.rsplit("-", 1)[1]
+            ips_act = [ip.strip() for ip in form.getvalue("ips", "").split(",") if ip.strip()]
+            if not ips_act:
                 return self._json({"ok": False, "msg": "Nessun router selezionato"})
-            def _ros_install_one(ip_, _cred_id=cred_id_in, _channel=channel_in):
-                name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
-                if _cred_id:
-                    u, p = _resolve_cred_id(_cred_id)
-                else:
-                    u, p = _get_device_creds(ip_)
-                if not u:
-                    return {"ip": ip_, "name": name_, "ok": False,
-                            "msg": "Credenziali SSH non configurate"}
-                try:
-                    ssh = _ssh_connect_creds(ip_, u, p)
-                    if _channel:
-                        _, _ci, _ = ssh.exec_command(
-                            f"/system package update set channel={_channel}")
-                        _ci.channel.settimeout(10)
-                        try: _ci.read()
-                        except Exception: pass
-                    _, out, _ = ssh.exec_command("/system package update download")
-                    _read_ssh_channel(out.channel, timeout=90)
-                    _, out, _ = ssh.exec_command("/system package update install")
-                    _read_ssh_channel(out.channel, timeout=15)
-                    try:
-                        ssh.close()
-                    except Exception:
-                        pass
-                    app_log("system", "info", f"RouterOS upgrade install avviato su {ip_}")
-                    return {"ip": ip_, "name": name_, "ok": True,
-                            "msg": "Update avviato — il router si riavvierà"}
-                except Exception as e_:
-                    return {"ip": ip_, "name": name_, "ok": False, "msg": _ssh_err_str(e_)}
-            results = []
-            _ex2 = ThreadPoolExecutor(max_workers=min(len(ips), 16))
-            try:
-                futs = {_ex2.submit(_ros_install_one, ip): ip for ip in ips}
-                try:
-                    for fut in as_completed(futs, timeout=120):
-                        try:
-                            results.append(fut.result())
-                        except Exception as e_:
-                            ip_ = futs[fut]
-                            name_ = next((rr.get("name","") for rr in ROUTERS
-                                          if rr["ip"] == ip_), "")
-                            results.append({"ip": ip_, "name": name_,
-                                            "ok": False, "msg": _ssh_err_str(e_)})
-                except FuturesTimeout:
-                    for fut, ip_ in futs.items():
-                        if not fut.done():
-                            name_ = next((rr.get("name","") for rr in ROUTERS
-                                          if rr["ip"] == ip_), "")
-                            results.append({"ip": ip_, "name": name_,
-                                            "ok": False, "msg": "Timeout"})
-            finally:
-                _ex2.shutdown(wait=False)
-            return self._json({"ok": True, "results": results})
-
-        if path == "/api/ros-download":
-            # Download only — no install/reboot
-            ips_raw    = form.getvalue("ips", "")
-            cred_id_dl = form.getvalue("cred_id", "")
-            channel_dl = form.getvalue("channel", "").strip()
-            ips = [ip.strip() for ip in ips_raw.split(",") if ip.strip()]
-            if not ips:
-                return self._json({"ok": False, "msg": "Nessun router selezionato"})
-            def _ros_download_one(ip_, _channel=channel_dl):
-                name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
-                if cred_id_dl:
-                    u, p = _resolve_cred_id(cred_id_dl)
-                else:
-                    u, p = _get_device_creds(ip_)
-                if not u:
-                    return {"ip": ip_, "name": name_, "ok": False,
-                            "msg": "Credenziali SSH non configurate"}
-                try:
-                    ssh = _ssh_connect_creds(ip_, u, p)
-                    if _channel:
-                        _, _cd, _ = ssh.exec_command(
-                            f"/system package update set channel={_channel}")
-                        _cd.channel.settimeout(10)
-                        try: _cd.read()
-                        except Exception: pass
-                    _, out, _ = ssh.exec_command("/system package update download")
-                    _read_ssh_channel(out.channel, timeout=90)
-                    try: ssh.close()
-                    except Exception: pass
-                    app_log("system", "info", f"RouterOS download avviato su {ip_}")
-                    return {"ip": ip_, "name": name_, "ok": True,
-                            "msg": "Download completato — pronto per installazione"}
-                except Exception as e_:
-                    return {"ip": ip_, "name": name_, "ok": False, "msg": _ssh_err_str(e_)}
-            results_dl = []
-            _ex_dl = ThreadPoolExecutor(max_workers=min(len(ips), 16))
-            try:
-                futs_dl = {_ex_dl.submit(_ros_download_one, ip): ip for ip in ips}
-                try:
-                    for fut in as_completed(futs_dl, timeout=120):
-                        try:   results_dl.append(fut.result())
-                        except Exception as e_:
-                            ip_ = futs_dl[fut]
-                            name_ = next((rr.get("name","") for rr in ROUTERS
-                                          if rr["ip"] == ip_), "")
-                            results_dl.append({"ip": ip_, "name": name_,
-                                               "ok": False, "msg": _ssh_err_str(e_)})
-                except FuturesTimeout:
-                    for fut, ip_ in futs_dl.items():
-                        if not fut.done():
-                            name_ = next((rr.get("name","") for rr in ROUTERS
-                                          if rr["ip"] == ip_), "")
-                            results_dl.append({"ip": ip_, "name": name_,
-                                               "ok": False, "msg": "Timeout"})
-            finally:
-                _ex_dl.shutdown(wait=False)
-            return self._json({"ok": True, "results": results_dl})
+            cred_id_act = form.getvalue("cred_id", "")
+            channel_act = form.getvalue("channel", "").strip()
+            jid_act = str(uuid.uuid4())
+            with JOBS_LOCK:
+                JOBS[jid_act] = {
+                    "done": 0, "total": len(ips_act), "results": [],
+                    "action": action_,
+                    "hosts": {ip: {"state": "queued", "step": "",
+                                   "name": next((rr.get("name", "") for rr in ROUTERS
+                                                 if rr["ip"] == ip), "")}
+                              for ip in ips_act},
+                }
+            threading.Thread(target=_upg_run_job,
+                             args=(jid_act, ips_act, action_, cred_id_act, channel_act),
+                             daemon=True).start()
+            return self._json({"ok": True, "job_id": jid_act, "total": len(ips_act)})
 
         # ── RouterOS upgrade via .npk upload ───────────────────────────
         if path == "/upload_npk":
@@ -13178,6 +13201,15 @@ function discSort(col) {{
 .result-ip {{ color: var(--accent2); min-width: 110px; font-weight: 600; }}
 .result-name {{ color: var(--text2); min-width: 160px; }}
 .result-msg {{ color: var(--text3); font-size: 10px; flex: 1; }}
+.up-live {{ border:1px solid var(--border); border-radius:8px; background:var(--bg2); padding:10px 14px; }}
+.up-kpis {{ display:flex; gap:22px; align-items:flex-end; flex-wrap:wrap; margin-bottom:8px; }}
+.up-kpis .n {{ font-size:18px; font-weight:700; color:var(--text2); }}
+.up-kpis .l {{ font-size:10px; color:var(--text2); text-transform:uppercase; letter-spacing:.04em; }}
+.up-chip {{ font-family:var(--mono); font-size:10px; padding:2px 8px; border-radius:10px; border:1px solid var(--border2); color:var(--text2); }}
+.up-chip.s-running {{ color:var(--accent); border-color:var(--accent); }}
+.up-chip.s-queued {{ color:var(--yellow); border-color:var(--yellow); opacity:.8; }}
+.up-chip.s-ok {{ color:var(--green); border-color:var(--green); }}
+.up-chip.s-failed {{ color:var(--red); border-color:var(--red); }}
 .result-ok   {{ color: var(--green); }}
 .result-fail {{ color: var(--red); }}
 </style>
@@ -13248,10 +13280,19 @@ function discSort(col) {{
     </div>
 
     <div style="display:none;" id="upProgressWrap">
-      <div style="background:var(--bg3);border-radius:6px;height:7px;overflow:hidden;margin-bottom:6px;">
-        <div id="upBar" style="height:100%;width:0%;background:var(--accent);border-radius:6px;transition:width .3s;"></div>
+      <div class="up-live">
+        <div class="up-kpis">
+          <div><div class="n" id="upKpiRun" style="color:var(--accent);">0</div><div class="l">{"Active" if LANGUAGE == "en" else "Attivi"}</div></div>
+          <div><div class="n" id="upKpiQueued" style="color:var(--yellow);">0</div><div class="l">{"Queued" if LANGUAGE == "en" else "In coda"}</div></div>
+          <div><div class="n" id="upKpiDone">0</div><div class="l">{"Done" if LANGUAGE == "en" else "Completati"}</div></div>
+          <div><div class="n" id="upKpiFail" style="color:var(--red);">0</div><div class="l">{"Failed" if LANGUAGE == "en" else "Falliti"}</div></div>
+        </div>
+        <div style="background:var(--bg3);border-radius:6px;height:5px;overflow:hidden;margin-bottom:8px;">
+          <div id="upBar" style="height:100%;width:0%;background:var(--accent);border-radius:6px;transition:width .4s;"></div>
+        </div>
+        <div id="upChips" style="display:flex;flex-wrap:wrap;gap:5px;"></div>
       </div>
-      <div id="upMsg" style="font-size:11px;color:var(--text2);"></div>
+      <div id="upMsg" style="font-size:11px;color:var(--text2);margin-top:6px;"></div>
     </div>
 
     <div class="result-list" id="resultList"></div>
@@ -13386,6 +13427,7 @@ async function startUploadImport() {{
   stat.textContent = '';
   wrap.style.display = 'block';
   bar.style.width = '0%';
+  msg.style.color = 'var(--text2)';
   msg.textContent = 'Invio richiesta…';
   rlist.innerHTML = '';
   rlist.classList.add('visible');
@@ -13410,25 +13452,54 @@ async function startUploadImport() {{
   }}
 }}
 
+const UP_STEP = {{
+  connecting: '{"connecting" if LANGUAGE == "en" else "connessione"}',
+  uploading:  '{"uploading" if LANGUAGE == "en" else "caricamento"}',
+  importing:  '{"running script" if LANGUAGE == "en" else "esecuzione script"}'
+}};
+function _upEsc(t) {{
+  return String(t == null ? '' : t).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+}}
+
 function pollJob(job_id, total, bar, msg, btn, rlist) {{
   clearTimeout(_pollTimer);
   _pollTimer = setTimeout(async () => {{
-    const j = await fetch('/api/job?id=' + job_id).then(r => r.json());
-    const pct = total > 0 ? Math.round(j.done / total * 100) : 0;
-    bar.style.width = pct + '%';
-    const ok   = j.results.filter(r => r.ok).length;
-    const fail = j.results.filter(r => !r.ok).length;
-    msg.textContent = j.done + ' / ' + total + '  OK ' + ok + '  x ' + fail;
+    let j;
+    try {{
+      j = await fetch('/api/job?id=' + job_id, {{cache: 'no-store'}}).then(r => r.json());
+    }} catch (e) {{
+      msg.textContent = 'x ' + e;
+      btn.disabled = false;
+      return;
+    }}
+    const hosts = j.hosts || {{}};
+    const ips = Object.keys(hosts);
+    const cnt = {{queued: 0, running: 0, ok: 0, failed: 0}};
+    ips.forEach(ip => {{ cnt[hosts[ip].state] = (cnt[hosts[ip].state] || 0) + 1; }});
+    bar.style.width = (total > 0 ? Math.round(j.done / total * 100) : 0) + '%';
+    document.getElementById('upKpiRun').textContent    = cnt.running;
+    document.getElementById('upKpiQueued').textContent = cnt.queued;
+    document.getElementById('upKpiDone').textContent   = j.done + ' / ' + total;
+    document.getElementById('upKpiFail').textContent   = cnt.failed;
 
-    // Render results
+    const chips = document.getElementById('upChips');
+    chips.innerHTML = '';
+    ips.forEach(ip => {{
+      const h = hosts[ip];
+      const c = document.createElement('span');
+      c.className = 'up-chip s-' + h.state;
+      c.textContent = ip + (h.state === 'running' && h.step ? ' · ' + (UP_STEP[h.step] || h.step) : '');
+      c.title = (h.name || '') + (h.msg ? ' — ' + h.msg : '');
+      chips.appendChild(c);
+    }});
+
     rlist.innerHTML = j.results.map(r => {{
       const cls = r.ok ? 'result-ok' : 'result-fail';
-      const ico = r.ok ? 'OK' : 'x';
       return '<div class="result-item">'
-        + '<span class="' + cls + '">' + ico + '</span>'
-        + '<span class="result-ip">' + r.ip + '</span>'
-        + '<span class="result-name">' + (r.name || '—') + '</span>'
-        + '<span class="result-msg">' + (r.msg || '') + '</span>'
+        + '<span class="' + cls + '">' + (r.ok ? 'OK' : 'x') + '</span>'
+        + '<span class="result-ip">' + _upEsc(r.ip) + '</span>'
+        + '<span class="result-name">' + _upEsc(r.name || '—') + '</span>'
+        + '<span class="result-msg">' + _upEsc(r.msg || '') + '</span>'
         + '</div>';
     }}).join('');
 
@@ -13436,12 +13507,11 @@ function pollJob(job_id, total, bar, msg, btn, rlist) {{
       pollJob(job_id, total, bar, msg, btn, rlist);
     }} else {{
       btn.disabled = false;
-      msg.style.color = fail === 0 ? 'var(--green)' : 'var(--red)';
-      msg.textContent += '  — Completato';
+      msg.style.color = cnt.failed === 0 ? 'var(--green)' : 'var(--red)';
+      msg.textContent = '{"Completed" if LANGUAGE == "en" else "Completato"}: ' + cnt.ok + ' OK, ' + cnt.failed + ' {"failed" if LANGUAGE == "en" else "falliti"}';
     }}
   }}, 600);
-}}
-</script>
+}}</script>
 """, session=session, page_key="upload")
 
     def render_stats_page(self, session=None):
@@ -14314,6 +14384,17 @@ _draw();
 .upg-res-row{{display:flex;align-items:center;gap:10px;padding:8px 14px;
   border-bottom:1px solid var(--border);font-size:11px;}}
 .upg-res-row:last-child{{border-bottom:none;}}
+.upg-live{{border:1px solid var(--border);border-radius:8px;background:var(--bg2);padding:10px 14px;margin-bottom:8px;}}
+.upg-live-kpis{{display:flex;gap:22px;align-items:flex-end;flex-wrap:wrap;margin-bottom:8px;}}
+.upg-live-kpis .n{{font-size:18px;font-weight:700;color:var(--text2);}}
+.upg-live-kpis .l{{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;}}
+.upg-live-bar{{background:var(--bg3);border-radius:6px;height:5px;overflow:hidden;margin-bottom:8px;}}
+.upg-live-bar>div{{height:100%;width:0%;background:var(--accent);transition:width .4s;}}
+.upg-chip{{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;border:1px solid var(--border2);color:var(--text2);}}
+.upg-chip.s-running{{color:var(--accent);border-color:var(--accent);}}
+.upg-chip.s-queued{{color:var(--yellow);border-color:var(--yellow);opacity:.8;}}
+.upg-chip.s-ok{{color:var(--green);border-color:var(--green);}}
+.upg-chip.s-failed{{color:var(--red);border-color:var(--red);}}
 .upg-res-dot{{width:8px;height:8px;border-radius:50%;background:var(--border2);flex-shrink:0;}}
 .upg-res-dot.update{{background:var(--yellow);}}
 .upg-res-ip{{color:var(--accent2);font-weight:700;font-family:var(--mono);min-width:115px;flex-shrink:0;}}
@@ -14409,6 +14490,11 @@ _draw();
                   style="background:var(--accent2);color:#fff;border-color:var(--accent2);">
             {"Download only" if lang_en else "Solo download"}
           </button>
+          <button class="btn" id="upgRebootBtn" onclick="upgRebootInstall()" disabled
+                  title="{"Installs an already downloaded update by rebooting the router" if lang_en else "Installa un aggiornamento già scaricato riavviando il router"}"
+                  style="background:var(--yellow);color:#fff;border-color:var(--yellow);">
+            {"Install only (reboot)" if lang_en else "Solo installa (riavvio)"}
+          </button>
           <button class="btn" id="upgInstallBtn" onclick="upgInstallOnline()" disabled
                   style="background:var(--red);color:#fff;border-color:var(--red);">
             {"Download &amp; Install" if lang_en else "Scarica &amp; Installa"}
@@ -14420,6 +14506,17 @@ _draw();
            "<strong>Attenzione:</strong> L'installazione riavvierà il router — le connessioni saranno interrotte."}
         </div>
         <!-- Terminal monitor -->
+        <!-- Live progress (updates automatically while an action runs) -->
+        <div id="upgLive" class="upg-live" style="display:none;">
+          <div class="upg-live-kpis">
+            <div><div class="n" id="upgKpiRun" style="color:var(--accent);">0</div><div class="l">{"Active" if lang_en else "Attivi"}</div></div>
+            <div><div class="n" id="upgKpiQueued" style="color:var(--yellow);">0</div><div class="l">{"Queued" if lang_en else "In coda"}</div></div>
+            <div><div class="n" id="upgKpiDone">0</div><div class="l">{"Done" if lang_en else "Completati"}</div></div>
+            <div><div class="n" id="upgKpiFail" style="color:var(--red);">0</div><div class="l">{"Failed" if lang_en else "Falliti"}</div></div>
+          </div>
+          <div class="upg-live-bar"><div id="upgLiveBar"></div></div>
+          <div id="upgLiveChips" style="display:flex;flex-wrap:wrap;gap:5px;"></div>
+        </div>
         <div id="upgTermWrap">
           <div id="upgTerminal" style="
             background:#0d1117;border-radius:6px;
@@ -14587,7 +14684,10 @@ async function upgCheckOnline() {{
   if(!ips.length){{alert('{"Select at least one router." if lang_en else "Seleziona almeno un router."}');return;}}
   checkBtn.disabled=true;
   document.getElementById('upgInstallBtn').disabled=true;
+  document.getElementById('upgRebootBtn').disabled=true;
   document.getElementById('upgDownloadBtn').disabled=true;
+  _upgHostSeen={{}};
+  document.getElementById('upgLive').style.display='none';
   var terminal=document.getElementById('upgTerminal');
   var rl=document.getElementById('upgOnlineResults');
   terminal.innerHTML='';
@@ -14614,7 +14714,8 @@ function _upgPollCheckJob(job_id, total, seen, checkBtn) {{
   clearTimeout(_upgCheckPoll);
   _upgCheckPoll=setTimeout(async function(){{
     try {{
-      var j=await fetch('/api/job?id='+job_id).then(r=>r.json());
+      var j=await fetch('/api/job?id='+job_id,{{cache:'no-store'}}).then(r=>r.json());
+      _upgRenderLive(j, true);
       var newRows=j.results.slice(seen);
       newRows.forEach(function(row){{
         _upgCheckRes.push(row);
@@ -14642,6 +14743,7 @@ function _upgPollCheckJob(job_id, total, seen, checkBtn) {{
           +'  OK '+ok+'  x '+fail, hasUpd?'#d29922':'#3fb950');
         checkBtn.disabled=false;
         document.getElementById('upgInstallBtn').disabled=(hasUpd===0);
+        document.getElementById('upgRebootBtn').disabled=(hasUpd===0);
         document.getElementById('upgDownloadBtn').disabled=(hasUpd===0);
         // Show results list
         var rl=document.getElementById('upgOnlineResults');
@@ -14673,81 +14775,152 @@ function _upgPollCheckJob(job_id, total, seen, checkBtn) {{
   }},700);
 }}
 
-async function upgDownloadOnly() {{
-  var ips=upgGetIPs();
-  if(!ips.length){{alert('{"Select at least one router." if lang_en else "Seleziona almeno un router."}');return;}}
-  if(!confirm('{"Download updates on selected routers (no reboot)?" if lang_en else "Scaricare gli aggiornamenti sui router selezionati (senza riavvio)?"}'))return;
-  document.getElementById('upgDownloadBtn').disabled=true;
-  document.getElementById('upgInstallBtn').disabled=true;
-  document.getElementById('upgCheckBtn').disabled=true;
-  document.getElementById('upgTerminal').innerHTML='';
-  upgTermLine('{"Downloading updates (no install)…" if lang_en else "Download aggiornamenti (senza installazione)…"}','#79c0ff');
-  var fd=new URLSearchParams();
-  fd.append('ips',ips.join(','));
-  fd.append('cred_id',_upgGetCred());
-  fd.append('channel',_upgGetChannel());
-  try {{
-    var r=await fetch('/api/ros-download',{{method:'POST',body:fd}});
-    var d=await r.json();
-    document.getElementById('upgDownloadBtn').disabled=false;
-    document.getElementById('upgCheckBtn').disabled=false;
-    if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
-    upgTermLine('{"Download complete. Ready to install." if lang_en else "Download completato. Pronto per installazione."}','#3fb950');
-    var rl=document.getElementById('upgOnlineResults');
-    rl.style.display='block';
-    rl.innerHTML=d.results.map(function(row){{
-      var cls=row.ok?'ok':'fail';
-      return '<div class="upg-res-row">'
-        +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
-        +'<span class="upg-res-ip">'+row.ip+'</span>'
-        +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
-        +'<span class="upg-res-ver '+cls+'">'+(row.msg||'')+'</span></div>';
-    }}).join('');
-    document.getElementById('upgInstallBtn').disabled=false;
-  }} catch(e) {{
-    document.getElementById('upgDownloadBtn').disabled=false;
-    document.getElementById('upgCheckBtn').disabled=false;
-    upgTermLine('x '+e,'#f85149');
+var _upgRetryIPs=[];
+function upgRenderResults(results, action) {{
+  var rl=document.getElementById('upgOnlineResults');
+  rl.style.display='block';
+  var failed=results.filter(function(r){{return !r.ok;}});
+  _upgRetryIPs=failed.map(function(r){{return r.ip;}});
+  var html=results.map(function(row){{
+    return '<div class="upg-res-row">'
+      +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
+      +'<span class="upg-res-ip">'+row.ip+'</span>'
+      +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
+      +'<span class="upg-res-ver '+(row.ok?'ok':'fail')+'">'+(row.msg||'')+'</span></div>';
+  }}).join('');
+  if(failed.length){{
+    html='<div class="upg-res-row" style="justify-content:space-between;background:var(--bg3);">'
+      +'<span>'+failed.length+' / '+results.length+' {"failed" if lang_en else "falliti"}</span>'
+      +'<button class="btn" data-a="'+action+'" onclick="upgRetryFailed(this.dataset.a)">{"Retry failed" if lang_en else "Riprova falliti"} ('+failed.length+')</button></div>'+html;
+    upgTermLine(failed.length+' {"host(s) failed — use Retry failed to run again on only those." if lang_en else "host falliti — usa Riprova falliti per ripetere solo su quelli."}','#d29922');
   }}
+  rl.innerHTML=html;
+}}
+function upgRetryFailed(action) {{
+  document.querySelectorAll('.upg-check').forEach(function(cb){{
+    cb.checked=_upgRetryIPs.indexOf(cb.dataset.ip)>=0;
+  }});
+  upgCount();
+  upgRunAction(action);
 }}
 
-async function upgInstallOnline() {{
+var _upgPoll=null, _upgHostSeen={{}};
+var UPG_STEP={{
+  connecting:'{"connecting" if lang_en else "connessione"}',
+  checking:'{"checking" if lang_en else "verifica"}',
+  downloading:'{"downloading" if lang_en else "download"}',
+  installing:'{"installing" if lang_en else "installazione"}',
+  rebooting:'{"rebooting" if lang_en else "riavvio"}'
+}};
+var UPG_CFG={{
+  download:{{url:'/api/ros-download',
+    confirm:'{"Download updates on selected routers (no reboot)?" if lang_en else "Scaricare gli aggiornamenti sui router selezionati (senza riavvio)?"}',
+    start:'{"Downloading updates (no install)…" if lang_en else "Download aggiornamenti (senza installazione)…"}',
+    done:'{"Download finished." if lang_en else "Download terminato."}'}},
+  reboot:{{url:'/api/ros-reboot',
+    confirm:'{"Reboot the selected routers to install the downloaded update?" if lang_en else "Riavviare i router selezionati per installare gli aggiornamenti scaricati?"}',
+    start:'{"Installing downloaded update (reboot)…" if lang_en else "Installazione aggiornamento scaricato (riavvio)…"}',
+    done:'{"Install finished — routers rebooting." if lang_en else "Installazione terminata — i router si riavviano."}'}},
+  install:{{url:'/api/ros-install',
+    confirm:'{"Install updates and reboot the selected routers?" if lang_en else "Installare gli aggiornamenti e riavviare i router selezionati?"}',
+    start:'{"Downloading and installing…" if lang_en else "Download e installazione in corso…"}',
+    done:'{"Install finished — routers rebooting." if lang_en else "Installazione terminata — i router si riavviano."}'}}
+}};
+function _upgBtnsDisabled(v) {{
+  ['upgRebootBtn','upgInstallBtn','upgDownloadBtn','upgCheckBtn'].forEach(function(b){{
+    document.getElementById(b).disabled=v;
+  }});
+}}
+function _upgEsc(t) {{
+  return String(t).replace(/[&<>"]/g,function(c){{return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];}});
+}}
+async function upgRunAction(action) {{
+  var cfg=UPG_CFG[action];
   var ips=upgGetIPs();
-  if(!ips.length){{alert('! {T("Seleziona almeno un router.")}');return;}}
-  if(!confirm('{"Install updates and reboot the selected routers?" if lang_en else "Installare gli aggiornamenti e riavviare i router selezionati?"}'))return;
-  document.getElementById('upgInstallBtn').disabled=true;
-  document.getElementById('upgDownloadBtn').disabled=true;
-  document.getElementById('upgCheckBtn').disabled=true;
+  if(!ips.length){{alert('{"Select at least one router." if lang_en else "Seleziona almeno un router."}');return;}}
+  if(!confirm(cfg.confirm))return;
+  _upgBtnsDisabled(true);
+  _upgHostSeen={{}};
   document.getElementById('upgTerminal').innerHTML='';
-  upgTermLine('{"Downloading and installing…" if lang_en else "Download e installazione in corso…"}','#79c0ff');
+  var rl=document.getElementById('upgOnlineResults');
+  rl.style.display='none'; rl.innerHTML='';
+  document.getElementById('upgLive').style.display='none';
+  upgTermLine(cfg.start,'#79c0ff');
   var fd=new URLSearchParams();
   fd.append('ips',ips.join(','));
   fd.append('cred_id',_upgGetCred());
   fd.append('channel',_upgGetChannel());
   try {{
-    var r=await fetch('/api/ros-install',{{method:'POST',body:fd}});
+    var r=await fetch(cfg.url,{{method:'POST',body:fd}});
     var d=await r.json();
-    document.getElementById('upgInstallBtn').disabled=false;
-    document.getElementById('upgDownloadBtn').disabled=false;
-    document.getElementById('upgCheckBtn').disabled=false;
-    if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
-    upgTermLine('{"Install complete — routers rebooting." if lang_en else "Installazione avviata — i router si riavvieranno."}','#3fb950');
-    var rl=document.getElementById('upgOnlineResults');
-    rl.style.display='block';
-    rl.innerHTML=d.results.map(function(row){{
-      var cls=row.ok?'ok':'fail';
-      return '<div class="upg-res-row">'
-        +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
-        +'<span class="upg-res-ip">'+row.ip+'</span>'
-        +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
-        +'<span class="upg-res-ver '+cls+'">'+(row.msg||'')+'</span></div>';
-    }}).join('');
+    if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');_upgBtnsDisabled(false);return;}}
+    _upgPollAction(d.job_id, action);
   }} catch(e) {{
-    document.getElementById('upgInstallBtn').disabled=false;
-    document.getElementById('upgDownloadBtn').disabled=false;
-    document.getElementById('upgCheckBtn').disabled=false;
     upgTermLine('x '+e,'#f85149');
+    _upgBtnsDisabled(false);
   }}
+}}
+function upgDownloadOnly()  {{ return upgRunAction('download'); }}
+function upgRebootInstall() {{ return upgRunAction('reboot'); }}
+function upgInstallOnline() {{ return upgRunAction('install'); }}
+
+function _upgPollAction(jid, action) {{
+  clearTimeout(_upgPoll);
+  _upgPoll=setTimeout(async function(){{
+    try {{
+      var j=await fetch('/api/job?id='+jid,{{cache:'no-store'}}).then(function(r){{return r.json();}});
+      if(!j.total){{upgTermLine('x {"Job not found." if lang_en else "Job non trovato."}','#f85149');_upgBtnsDisabled(false);return;}}
+      _upgRenderLive(j);
+      if(j.done<j.total){{_upgPollAction(jid, action);return;}}
+      _upgFinish(j, action);
+    }} catch(e) {{
+      upgTermLine('x Poll error: '+e,'#f85149');
+      _upgBtnsDisabled(false);
+    }}
+  }},700);
+}}
+
+function _upgRenderLive(j, quiet) {{
+  var hosts=j.hosts||{{}};
+  var ips=Object.keys(hosts);
+  var cnt={{queued:0,running:0,ok:0,failed:0}};
+  ips.forEach(function(ip){{
+    var h=hosts[ip];
+    cnt[h.state]=(cnt[h.state]||0)+1;
+    var key=h.state+':'+h.step;
+    if(_upgHostSeen[ip]===key) return;
+    _upgHostSeen[ip]=key;
+    var nm=ip+(h.name?' ('+_upgEsc(h.name)+')':'');
+    if(h.state==='running')     upgTermLine(nm+' — '+(UPG_STEP[h.step]||h.step)+'…','#79c0ff');
+    else if(quiet) return;
+    else if(h.state==='ok')     upgTermLine('OK '+nm+' — '+_upgEsc(h.msg||''),'#3fb950');
+    else if(h.state==='failed') upgTermLine('x '+nm+' — '+_upgEsc(h.msg||''),'#f85149');
+  }});
+  document.getElementById('upgLive').style.display='block';
+  document.getElementById('upgKpiRun').textContent=cnt.running;
+  document.getElementById('upgKpiQueued').textContent=cnt.queued;
+  document.getElementById('upgKpiDone').textContent=j.done+' / '+j.total;
+  document.getElementById('upgKpiFail').textContent=cnt.failed;
+  document.getElementById('upgLiveBar').style.width=(j.total?Math.round(100*j.done/j.total):0)+'%';
+  var chips=document.getElementById('upgLiveChips');
+  chips.innerHTML='';
+  ips.forEach(function(ip){{
+    var h=hosts[ip];
+    var c=document.createElement('span');
+    c.className='upg-chip s-'+h.state;
+    c.textContent=ip+(h.state==='running'&&h.step?' · '+(UPG_STEP[h.step]||h.step):'');
+    c.title=(h.name||'')+(h.msg?' — '+h.msg:'');
+    chips.appendChild(c);
+  }});
+}}
+
+function _upgFinish(j, action) {{
+  _upgBtnsDisabled(false);
+  var ok=j.results.filter(function(r){{return r.ok;}}).length;
+  var fail=j.results.length-ok;
+  upgTermLine('─────────────────────────────────────────','#484f58');
+  upgTermLine(UPG_CFG[action].done+'  OK '+ok+'  x '+fail, fail?'#d29922':'#3fb950');
+  upgRenderResults(j.results, action);
 }}
 
 // ── Tab 2: .npk upload ──────────────────────────────────────────
