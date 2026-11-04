@@ -809,6 +809,7 @@ _T_EN: dict = {
     "Inserisci nome e comando SSH": "Enter a name and SSH command",
     "Rimuovere questa colonna?": "Remove this column?",
     "Seleziona almeno un router.": "Select at least one router.",
+    "Invio richiesta…": "Sending request…",
     "router selezionati": "routers selected",
     "Seleziona almeno un device.": "Select at least one device.",
     "Seleziona una sede.": "Select a site.",
