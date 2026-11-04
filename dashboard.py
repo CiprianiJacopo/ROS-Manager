@@ -6183,7 +6183,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "Nessun router selezionato"})
             job_id_chk = str(uuid.uuid4())
             with JOBS_LOCK:
-                JOBS[job_id_chk] = {"done": 0, "total": len(ips_chk), "results": []}
+                JOBS[job_id_chk] = {
+                    "done": 0, "total": len(ips_chk), "results": [], "action": "check",
+                    "hosts": {ip: {"state": "queued", "step": "",
+                                   "name": next((rr.get("name", "") for rr in ROUTERS
+                                                 if rr["ip"] == ip), "")}
+                              for ip in ips_chk},
+                }
             def _run_ros_check_job(jid, ip_list, _cred_id=cred_id_ck, _channel=channel_ck):
                 def _one(ip_):
                     name_ = next((rr.get("name","") for rr in ROUTERS if rr["ip"] == ip_), "")
@@ -6195,7 +6201,9 @@ class Handler(BaseHTTPRequestHandler):
                         return {"ip": ip_, "name": name_, "ok": False,
                                 "msg": "Credenziali SSH non configurate"}
                     try:
+                        _upg_set(jid, ip_, state="running", step="connecting")
                         ssh = _ssh_connect_creds(ip_, u, p)
+                        _upg_set(jid, ip_, state="running", step="checking")
                         if _channel:
                             _, _co, _ = ssh.exec_command(
                                 f"/system package update set channel={_channel}")
@@ -6246,6 +6254,14 @@ class Handler(BaseHTTPRequestHandler):
                             with JOBS_LOCK:
                                 JOBS[jid]["results"].append(res)
                                 JOBS[jid]["done"] += 1
+                                if res["ok"]:
+                                    _msg = res["current"]
+                                    if res["latest"] != "?" and res["current"] != res["latest"]:
+                                        _msg += " -> " + res["latest"]
+                                else:
+                                    _msg = res.get("msg", "")
+                                JOBS[jid]["hosts"][res["ip"]].update(
+                                    state="ok" if res["ok"] else "failed", step="", msg=_msg)
                     except FuturesTimeout:
                         for fut, ip_ in futs.items():
                             if not fut.done():
@@ -6255,6 +6271,8 @@ class Handler(BaseHTTPRequestHandler):
                                     JOBS[jid]["results"].append(
                                         {"ip": ip_, "name": name_, "ok": False, "msg": "Timeout"})
                                     JOBS[jid]["done"] += 1
+                                    JOBS[jid]["hosts"][ip_].update(
+                                        state="failed", step="", msg="Timeout")
                 finally:
                     ex.shutdown(wait=False)
             threading.Thread(target=_run_ros_check_job,
@@ -14609,6 +14627,8 @@ async function upgCheckOnline() {{
   document.getElementById('upgInstallBtn').disabled=true;
   document.getElementById('upgRebootBtn').disabled=true;
   document.getElementById('upgDownloadBtn').disabled=true;
+  _upgHostSeen={{}};
+  document.getElementById('upgLive').style.display='none';
   var terminal=document.getElementById('upgTerminal');
   var rl=document.getElementById('upgOnlineResults');
   terminal.innerHTML='';
@@ -14635,7 +14655,8 @@ function _upgPollCheckJob(job_id, total, seen, checkBtn) {{
   clearTimeout(_upgCheckPoll);
   _upgCheckPoll=setTimeout(async function(){{
     try {{
-      var j=await fetch('/api/job?id='+job_id).then(r=>r.json());
+      var j=await fetch('/api/job?id='+job_id,{{cache:'no-store'}}).then(r=>r.json());
+      _upgRenderLive(j, true);
       var newRows=j.results.slice(seen);
       newRows.forEach(function(row){{
         _upgCheckRes.push(row);
@@ -14800,7 +14821,7 @@ function _upgPollAction(jid, action) {{
   }},700);
 }}
 
-function _upgRenderLive(j) {{
+function _upgRenderLive(j, quiet) {{
   var hosts=j.hosts||{{}};
   var ips=Object.keys(hosts);
   var cnt={{queued:0,running:0,ok:0,failed:0}};
@@ -14812,6 +14833,7 @@ function _upgRenderLive(j) {{
     _upgHostSeen[ip]=key;
     var nm=ip+(h.name?' ('+_upgEsc(h.name)+')':'');
     if(h.state==='running')     upgTermLine(nm+' — '+(UPG_STEP[h.step]||h.step)+'…','#79c0ff');
+    else if(quiet) return;
     else if(h.state==='ok')     upgTermLine('OK '+nm+' — '+_upgEsc(h.msg||''),'#3fb950');
     else if(h.state==='failed') upgTermLine('x '+nm+' — '+_upgEsc(h.msg||''),'#f85149');
   }});
