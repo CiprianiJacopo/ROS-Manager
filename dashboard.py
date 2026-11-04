@@ -2766,47 +2766,59 @@ def _bulk_job_worker(job_id, local_path, filename, targets):
             JOBS[job_id]["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
             JOBS[job_id]["done"] += 1
 
-def _upload_import_worker(job_id, local_path, filename, ips, run_after=True, cred_id=""):
-    """Background worker: SFTP push, then /import if run_after is True.
-    Credentials: if cred_id is provided it overrides per-device auto-resolve."""
+def _upload_import_host(job_id, ip, local_path, filename, run_after, cred_id):
+    """Push the script to one router (and /import it if requested); updates live host state."""
     remote = filename   # RouterOS SFTP root = flash
-    for ip in ips:
-        name = ""
-        try:
-            if cred_id:
-                username, password = _resolve_cred_id(cred_id)
-            else:
-                username, password = _get_device_creds(ip)
-            ssh  = _ssh_connect_creds(ip, username, password)
-            sftp = ssh.open_sftp()
-            sftp.put(local_path, remote)
-            sftp.close()
-            if run_after:
-                _, stdout, stderr = ssh.exec_command(f"/import file-name={remote}", timeout=30)
-                out = stdout.read().decode().strip()
-                err = stderr.read().decode().strip()
-                msg = out if out else (err if err else "OK")
-            else:
-                msg = "Uploaded"
-            ssh.close()
-            ok   = True
-            name = _update_router_script(ip, local_path, filename)
-        except Exception as e:
-            ok  = False
-            msg = _ssh_err_str(e)
-        with JOBS_LOCK:
-            JOBS[job_id]["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
-            JOBS[job_id]["done"] += 1
+    name = next((rr.get("name", "") for rr in ROUTERS if rr["ip"] == ip), "")
+    try:
+        _upg_set(job_id, ip, state="running", step="connecting")
+        if cred_id:
+            username, password = _resolve_cred_id(cred_id)
+        else:
+            username, password = _get_device_creds(ip)
+        ssh  = _ssh_connect_creds(ip, username, password)
+        _upg_set(job_id, ip, state="running", step="uploading")
+        sftp = ssh.open_sftp()
+        sftp.put(local_path, remote)
+        sftp.close()
+        if run_after:
+            _upg_set(job_id, ip, state="running", step="importing")
+            _, stdout, stderr = ssh.exec_command(f"/import file-name={remote}", timeout=30)
+            out = stdout.read().decode().strip()
+            err = stderr.read().decode().strip()
+            msg = out if out else (err if err else "OK")
+        else:
+            msg = "Uploaded"
+        ssh.close()
+        ok   = True
+        name = _update_router_script(ip, local_path, filename) or name
+    except Exception as e:
+        ok  = False
+        msg = _ssh_err_str(e)
+    with JOBS_LOCK:
+        job = JOBS[job_id]
+        job["results"].append({"ip": ip, "name": name, "ok": ok, "msg": msg})
+        job["done"] += 1
+        job["hosts"][ip].update(state="ok" if ok else "failed", step="", msg=msg)
+
+def _upload_import_worker(job_id, local_path, filename, ips, run_after=True, cred_id=""):
+    """Background worker: runs hosts in parallel. If cred_id is provided it overrides
+    per-device credential resolution."""
+    with ThreadPoolExecutor(max_workers=min(len(ips), 8) or 1) as ex:
+        for ip in ips:
+            ex.submit(_upload_import_host, job_id, ip, local_path, filename, run_after, cred_id)
 
 def start_upload_import_job(local_path, filename, ips, run_after=True, cred_id=""):
     job_id = str(uuid.uuid4())
+    names = {rr["ip"]: rr.get("name", "") for rr in ROUTERS}
     with JOBS_LOCK:
-        JOBS[job_id] = {"done": 0, "total": len(ips), "results": []}
+        JOBS[job_id] = {"done": 0, "total": len(ips), "results": [], "action": "upload",
+                        "hosts": {ip: {"state": "queued", "step": "", "name": names.get(ip, ""), "msg": ""}
+                                  for ip in ips}}
     threading.Thread(target=_upload_import_worker,
                      args=(job_id, local_path, filename, ips),
                      kwargs={"run_after": run_after, "cred_id": cred_id}, daemon=True).start()
     return job_id
-
 def start_bulk_job(local_path, filename, targets):
     """Start a background bulk-upload job. Returns job_id."""
     job_id = str(uuid.uuid4())
@@ -13189,6 +13201,15 @@ function discSort(col) {{
 .result-ip {{ color: var(--accent2); min-width: 110px; font-weight: 600; }}
 .result-name {{ color: var(--text2); min-width: 160px; }}
 .result-msg {{ color: var(--text3); font-size: 10px; flex: 1; }}
+.up-live {{ border:1px solid var(--border); border-radius:8px; background:var(--bg2); padding:10px 14px; }}
+.up-kpis {{ display:flex; gap:22px; align-items:flex-end; flex-wrap:wrap; margin-bottom:8px; }}
+.up-kpis .n {{ font-size:18px; font-weight:700; color:var(--text2); }}
+.up-kpis .l {{ font-size:10px; color:var(--text2); text-transform:uppercase; letter-spacing:.04em; }}
+.up-chip {{ font-family:var(--mono); font-size:10px; padding:2px 8px; border-radius:10px; border:1px solid var(--border2); color:var(--text2); }}
+.up-chip.s-running {{ color:var(--accent); border-color:var(--accent); }}
+.up-chip.s-queued {{ color:var(--yellow); border-color:var(--yellow); opacity:.8; }}
+.up-chip.s-ok {{ color:var(--green); border-color:var(--green); }}
+.up-chip.s-failed {{ color:var(--red); border-color:var(--red); }}
 .result-ok   {{ color: var(--green); }}
 .result-fail {{ color: var(--red); }}
 </style>
@@ -13259,10 +13280,19 @@ function discSort(col) {{
     </div>
 
     <div style="display:none;" id="upProgressWrap">
-      <div style="background:var(--bg3);border-radius:6px;height:7px;overflow:hidden;margin-bottom:6px;">
-        <div id="upBar" style="height:100%;width:0%;background:var(--accent);border-radius:6px;transition:width .3s;"></div>
+      <div class="up-live">
+        <div class="up-kpis">
+          <div><div class="n" id="upKpiRun" style="color:var(--accent);">0</div><div class="l">{"Active" if LANGUAGE == "en" else "Attivi"}</div></div>
+          <div><div class="n" id="upKpiQueued" style="color:var(--yellow);">0</div><div class="l">{"Queued" if LANGUAGE == "en" else "In coda"}</div></div>
+          <div><div class="n" id="upKpiDone">0</div><div class="l">{"Done" if LANGUAGE == "en" else "Completati"}</div></div>
+          <div><div class="n" id="upKpiFail" style="color:var(--red);">0</div><div class="l">{"Failed" if LANGUAGE == "en" else "Falliti"}</div></div>
+        </div>
+        <div style="background:var(--bg3);border-radius:6px;height:5px;overflow:hidden;margin-bottom:8px;">
+          <div id="upBar" style="height:100%;width:0%;background:var(--accent);border-radius:6px;transition:width .4s;"></div>
+        </div>
+        <div id="upChips" style="display:flex;flex-wrap:wrap;gap:5px;"></div>
       </div>
-      <div id="upMsg" style="font-size:11px;color:var(--text2);"></div>
+      <div id="upMsg" style="font-size:11px;color:var(--text2);margin-top:6px;"></div>
     </div>
 
     <div class="result-list" id="resultList"></div>
@@ -13397,6 +13427,7 @@ async function startUploadImport() {{
   stat.textContent = '';
   wrap.style.display = 'block';
   bar.style.width = '0%';
+  msg.style.color = 'var(--text2)';
   msg.textContent = 'Invio richiesta…';
   rlist.innerHTML = '';
   rlist.classList.add('visible');
@@ -13421,25 +13452,54 @@ async function startUploadImport() {{
   }}
 }}
 
+const UP_STEP = {{
+  connecting: '{"connecting" if LANGUAGE == "en" else "connessione"}',
+  uploading:  '{"uploading" if LANGUAGE == "en" else "caricamento"}',
+  importing:  '{"running script" if LANGUAGE == "en" else "esecuzione script"}'
+}};
+function _upEsc(t) {{
+  return String(t == null ? '' : t).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+}}
+
 function pollJob(job_id, total, bar, msg, btn, rlist) {{
   clearTimeout(_pollTimer);
   _pollTimer = setTimeout(async () => {{
-    const j = await fetch('/api/job?id=' + job_id).then(r => r.json());
-    const pct = total > 0 ? Math.round(j.done / total * 100) : 0;
-    bar.style.width = pct + '%';
-    const ok   = j.results.filter(r => r.ok).length;
-    const fail = j.results.filter(r => !r.ok).length;
-    msg.textContent = j.done + ' / ' + total + '  OK ' + ok + '  x ' + fail;
+    let j;
+    try {{
+      j = await fetch('/api/job?id=' + job_id, {{cache: 'no-store'}}).then(r => r.json());
+    }} catch (e) {{
+      msg.textContent = 'x ' + e;
+      btn.disabled = false;
+      return;
+    }}
+    const hosts = j.hosts || {{}};
+    const ips = Object.keys(hosts);
+    const cnt = {{queued: 0, running: 0, ok: 0, failed: 0}};
+    ips.forEach(ip => {{ cnt[hosts[ip].state] = (cnt[hosts[ip].state] || 0) + 1; }});
+    bar.style.width = (total > 0 ? Math.round(j.done / total * 100) : 0) + '%';
+    document.getElementById('upKpiRun').textContent    = cnt.running;
+    document.getElementById('upKpiQueued').textContent = cnt.queued;
+    document.getElementById('upKpiDone').textContent   = j.done + ' / ' + total;
+    document.getElementById('upKpiFail').textContent   = cnt.failed;
 
-    // Render results
+    const chips = document.getElementById('upChips');
+    chips.innerHTML = '';
+    ips.forEach(ip => {{
+      const h = hosts[ip];
+      const c = document.createElement('span');
+      c.className = 'up-chip s-' + h.state;
+      c.textContent = ip + (h.state === 'running' && h.step ? ' · ' + (UP_STEP[h.step] || h.step) : '');
+      c.title = (h.name || '') + (h.msg ? ' — ' + h.msg : '');
+      chips.appendChild(c);
+    }});
+
     rlist.innerHTML = j.results.map(r => {{
       const cls = r.ok ? 'result-ok' : 'result-fail';
-      const ico = r.ok ? 'OK' : 'x';
       return '<div class="result-item">'
-        + '<span class="' + cls + '">' + ico + '</span>'
-        + '<span class="result-ip">' + r.ip + '</span>'
-        + '<span class="result-name">' + (r.name || '—') + '</span>'
-        + '<span class="result-msg">' + (r.msg || '') + '</span>'
+        + '<span class="' + cls + '">' + (r.ok ? 'OK' : 'x') + '</span>'
+        + '<span class="result-ip">' + _upEsc(r.ip) + '</span>'
+        + '<span class="result-name">' + _upEsc(r.name || '—') + '</span>'
+        + '<span class="result-msg">' + _upEsc(r.msg || '') + '</span>'
         + '</div>';
     }}).join('');
 
@@ -13447,12 +13507,11 @@ function pollJob(job_id, total, bar, msg, btn, rlist) {{
       pollJob(job_id, total, bar, msg, btn, rlist);
     }} else {{
       btn.disabled = false;
-      msg.style.color = fail === 0 ? 'var(--green)' : 'var(--red)';
-      msg.textContent += '  — Completato';
+      msg.style.color = cnt.failed === 0 ? 'var(--green)' : 'var(--red)';
+      msg.textContent = '{"Completed" if LANGUAGE == "en" else "Completato"}: ' + cnt.ok + ' OK, ' + cnt.failed + ' {"failed" if LANGUAGE == "en" else "falliti"}';
     }}
   }}, 600);
-}}
-</script>
+}}</script>
 """, session=session, page_key="upload")
 
     def render_stats_page(self, session=None):
