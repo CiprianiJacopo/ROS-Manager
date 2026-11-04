@@ -904,6 +904,7 @@ _LOG_PATTERNS = [
      r"Updated to v\1, installed by '\2'. Backup: \3"),
     (r"RouterOS upgrade install avviato su (.*)", r"RouterOS upgrade install started on \1"),
     (r"RouterOS download avviato su (.*)", r"RouterOS download started on \1"),
+    (r"RouterOS install \(riavvio\) avviato su (.*)", r"RouterOS install (reboot) started on \1"),
     (r"ROSM v(\S+) riavviato su porta 8080 \(richiesto da: '(.*)'\)",
      r"ROSM v\1 restarted on port 8080 (requested by: '\2')"),
     (r"ROSM v(\S+) avviato su porta 8080", r"ROSM v\1 started on port 8080"),
