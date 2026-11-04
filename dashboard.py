@@ -14748,6 +14748,35 @@ function _upgPollCheckJob(job_id, total, seen, checkBtn) {{
   }},700);
 }}
 
+var _upgRetryIPs=[];
+function upgRenderResults(results, action) {{
+  var rl=document.getElementById('upgOnlineResults');
+  rl.style.display='block';
+  var failed=results.filter(function(r){{return !r.ok;}});
+  _upgRetryIPs=failed.map(function(r){{return r.ip;}});
+  var html=results.map(function(row){{
+    return '<div class="upg-res-row">'
+      +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
+      +'<span class="upg-res-ip">'+row.ip+'</span>'
+      +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
+      +'<span class="upg-res-ver '+(row.ok?'ok':'fail')+'">'+(row.msg||'')+'</span></div>';
+  }}).join('');
+  if(failed.length){{
+    html='<div class="upg-res-row" style="justify-content:space-between;background:var(--bg3);">'
+      +'<span>'+failed.length+' / '+results.length+' {"failed" if lang_en else "falliti"}</span>'
+      +'<button class="btn" data-a="'+action+'" onclick="upgRetryFailed(this.dataset.a)">{"Retry failed" if lang_en else "Riprova falliti"} ('+failed.length+')</button></div>'+html;
+    upgTermLine(failed.length+' {"host(s) failed — use Retry failed to run again on only those." if lang_en else "host falliti — usa Riprova falliti per ripetere solo su quelli."}','#d29922');
+  }}
+  rl.innerHTML=html;
+}}
+function upgRetryFailed(action) {{
+  document.querySelectorAll('.upg-check').forEach(function(cb){{
+    cb.checked=_upgRetryIPs.indexOf(cb.dataset.ip)>=0;
+  }});
+  upgCount();
+  window[action]();
+}}
+
 async function upgDownloadOnly() {{
   var ips=upgGetIPs();
   if(!ips.length){{alert('{"Select at least one router." if lang_en else "Seleziona almeno un router."}');return;}}
@@ -14770,16 +14799,7 @@ async function upgDownloadOnly() {{
     document.getElementById('upgCheckBtn').disabled=false;
     if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
     upgTermLine('{"Download complete. Ready to install."  if lang_en else "Download completato. Pronto per installazione."}','#3fb950');
-    var rl=document.getElementById('upgOnlineResults');
-    rl.style.display='block';
-    rl.innerHTML=d.results.map(function(row){{
-      var cls=row.ok?'ok':'fail';
-      return '<div class="upg-res-row">'
-        +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
-        +'<span class="upg-res-ip">'+row.ip+'</span>'
-        +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
-        +'<span class="upg-res-ver '+cls+'">'+(row.msg||'')+'</span></div>';
-    }}).join('');
+    upgRenderResults(d.results,'upgDownloadOnly');
     document.getElementById('upgInstallBtn').disabled=false;
     document.getElementById('upgRebootBtn').disabled=false;
   }} catch(e) {{
@@ -14810,15 +14830,7 @@ async function upgRebootInstall() {{
       upgTermLine((row.ok?'OK ':'x ')+row.ip+(row.name?' ('+row.name+')':'')+' — '+(row.msg||''),
                   row.ok?'#3fb950':'#f85149');
     }});
-    var rl=document.getElementById('upgOnlineResults');
-    rl.style.display='block';
-    rl.innerHTML=d.results.map(function(row){{
-      return '<div class="upg-res-row">'
-        +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
-        +'<span class="upg-res-ip">'+row.ip+'</span>'
-        +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
-        +'<span class="upg-res-ver '+(row.ok?'ok':'fail')+'">'+(row.msg||'')+'</span></div>';
-    }}).join('');
+    upgRenderResults(d.results,'upgRebootInstall');
   }} catch(e) {{
     _enable();
     upgTermLine('x '+e,'#f85149');
@@ -14848,16 +14860,7 @@ async function upgInstallOnline() {{
     document.getElementById('upgCheckBtn').disabled=false;
     if(!d.ok){{upgTermLine('x '+d.msg,'#f85149');return;}}
     upgTermLine('{"Install complete — routers rebooting." if lang_en else "Installazione avviata — i router si riavvieranno."}','#3fb950');
-    var rl=document.getElementById('upgOnlineResults');
-    rl.style.display='block';
-    rl.innerHTML=d.results.map(function(row){{
-      var cls=row.ok?'ok':'fail';
-      return '<div class="upg-res-row">'
-        +'<span class="upg-res-dot'+(row.ok?' update':'')+'"></span>'
-        +'<span class="upg-res-ip">'+row.ip+'</span>'
-        +'<span class="upg-res-name">'+(row.name||'—')+'</span>'
-        +'<span class="upg-res-ver '+cls+'">'+(row.msg||'')+'</span></div>';
-    }}).join('');
+    upgRenderResults(d.results,'upgInstallOnline');
   }} catch(e) {{
     document.getElementById('upgInstallBtn').disabled=false;
     document.getElementById('upgRebootBtn').disabled=false;
