@@ -2818,6 +2818,10 @@ a:hover { color: var(--accent); }
   background: var(--bg3); box-shadow: 0 0 0 2px var(--accent3);
 }
 .btn:active { transform: translateY(1px); }
+.btn:disabled, .btn:disabled:hover, .btn:disabled:active {
+  cursor: not-allowed; opacity: .45; filter: grayscale(.5);
+  transform: none; box-shadow: none;
+}
 .btn-primary {
   background: var(--accent); border-color: var(--accent); color: #fff;
   font-weight: 600; letter-spacing: .3px;
@@ -14406,10 +14410,12 @@ _draw();
             {"Check versions" if lang_en else "Controlla versioni"}
           </button>
           <button class="btn" id="upgDownloadBtn" onclick="upgDownloadOnly()" disabled
+                  title="{"Needs “Check versions” to find updates first" if lang_en else "Richiede prima “Controlla versioni” per trovare aggiornamenti"}"
                   style="background:var(--accent2);color:#fff;border-color:var(--accent2);">
             {"Download only" if lang_en else "Solo download"}
           </button>
           <button class="btn" id="upgInstallBtn" onclick="upgInstallOnline()" disabled
+                  title="{"Needs “Check versions” to find updates first" if lang_en else "Richiede prima “Controlla versioni” per trovare aggiornamenti"}"
                   style="background:var(--red);color:#fff;border-color:var(--red);">
             {"Download &amp; Install" if lang_en else "Scarica &amp; Installa"}
           </button>
