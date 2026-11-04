@@ -1296,7 +1296,7 @@ def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
             banner = s.recv(256).decode("utf-8", errors="ignore").strip()
             s.close()
             bl = banner.lower()
-            if "routeros" in bl or "mikrotik" in bl:
+            if "routeros" in bl or "mikrotik" in bl or "rosssh" in bl:
                 result["device_type"] = "routeros"; result["vendor"] = "MikroTik"
             elif "ubnt" in bl or "ubiquiti" in bl:
                 result["device_type"] = "ubiquiti"; result["vendor"] = "Ubiquiti"
@@ -1310,6 +1310,32 @@ def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
         except Exception:
             pass
 
+    # HTTP fingerprinting (quick header grab)
+    for port in [80, 8080]:
+        if port in open_ports and result["vendor"] == "":
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((ip, port))
+                s.send(b"GET / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+                resp = s.recv(1024).decode("utf-8", errors="ignore").lower()
+                s.close()
+                if "mikrotik" in resp or "routeros" in resp:
+                    result["device_type"] = "routeros"; result["vendor"] = "MikroTik"
+                elif "ubnt" in resp or "ubiquiti" in resp or "airmax" in resp:
+                    result["device_type"] = "ubiquiti"; result["vendor"] = "Ubiquiti"
+                elif "cisco" in resp:
+                    result["device_type"] = "cisco";    result["vendor"] = "Cisco"
+                elif "synology" in resp:
+                    result["device_type"] = "nas";      result["vendor"] = "Synology"
+            except Exception:
+                pass
+            break
+
+    # SSH identity / hostname lookup. Runs after every fingerprint source (OUI, Winbox,
+    # SSH banner, HTTP) so a device recognised late as RouterOS still gets
+    # /system identity instead of Unix hostname commands.
+    if 22 in open_ports:
         # If RouterOS and credentials provided → fetch identity/model/mac
         if result["device_type"] == "routeros" and ssh_user and ssh_pass:
             try:
@@ -1340,28 +1366,6 @@ def fingerprint_host(ip, ssh_user=None, ssh_pass=None, timeout=1.5):
                         break
                 except Exception:
                     break
-
-    # HTTP fingerprinting (quick header grab)
-    for port in [80, 8080]:
-        if port in open_ports and result["vendor"] == "":
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(timeout)
-                s.connect((ip, port))
-                s.send(b"GET / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
-                resp = s.recv(1024).decode("utf-8", errors="ignore").lower()
-                s.close()
-                if "mikrotik" in resp or "routeros" in resp:
-                    result["device_type"] = "routeros"; result["vendor"] = "MikroTik"
-                elif "ubnt" in resp or "ubiquiti" in resp or "airmax" in resp:
-                    result["device_type"] = "ubiquiti"; result["vendor"] = "Ubiquiti"
-                elif "cisco" in resp:
-                    result["device_type"] = "cisco";    result["vendor"] = "Cisco"
-                elif "synology" in resp:
-                    result["device_type"] = "nas";      result["vendor"] = "Synology"
-            except Exception:
-                pass
-            break
 
     # ── Hostname resolution (stessa logica di Angry IP Scanner) ─
     def _clean(n):
