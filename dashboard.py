@@ -619,6 +619,7 @@ _T_EN: dict = {
     "precedente:": "previous:",
     "(riga ": "(line ",
     "Errore JS:": "JS error:",
+    "'sconosciuto'": "'unknown'",
     "Nome colonna (es. Free RAM)": "Column name (e.g. Free RAM)",
     "Aggiorna SSH": "Refresh SSH",
     "Avvia un ping": "Run ping",
